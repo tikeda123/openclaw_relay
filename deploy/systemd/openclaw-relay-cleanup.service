@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenClaw Relay artifact cleanup
+
+[Service]
+Type=oneshot
+User=relay
+Group=relay
+WorkingDirectory=/opt/openclaw_relay
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/openclaw_relay/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONPATH=/opt/openclaw_relay/src
+ExecStart=/opt/openclaw_relay/.venv/bin/python3 -m openclaw_relay --config /opt/openclaw_relay/config/relay.local.toml cleanup --older-than-days 7

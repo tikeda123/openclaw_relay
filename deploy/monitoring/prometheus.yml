@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 127.0.0.1:9093
+
+rule_files:
+  - /etc/prometheus/rules/openclaw-relay-alerts.yml
+
+scrape_configs:
+  - job_name: openclaw-relay
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - 127.0.0.1:18080
+        labels:
+          service: openclaw-relay
+          relay_node: relay-a

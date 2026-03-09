@@ -1,0 +1,110 @@
+groups:
+  - name: openclaw-relay
+    rules:
+      - alert: OpenClawRelayDown
+        expr: openclaw_relay_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenClaw Relay process is down"
+          description: "openclaw_relay_up is 0 for more than 1 minute."
+
+      - alert: OpenClawRelayNotReady
+        expr: openclaw_relay_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenClaw Relay is not ready"
+          description: "Relay readiness has been 0 for more than 2 minutes."
+
+      - alert: OpenClawRelaySourceSyncUnhealthy
+        expr: (openclaw_relay_source_sync_enabled == 1) and (openclaw_relay_source_sync_healthy == 0)
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenClaw Relay source sync is unhealthy"
+          description: "source_sync is configured but unhealthy for more than 3 minutes."
+
+      - alert: OpenClawRelayTunnelDown
+        expr: (openclaw_relay_endpoint_tunnel_configured == 1) and (openclaw_relay_endpoint_tunnel_healthy == 0)
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenClaw Relay SSH tunnel is down"
+          description: "Endpoint {{ $labels.endpoint }} tunnel has been unhealthy for more than 3 minutes."
+
+      - alert: OpenClawRelayEndpointHttpDown
+        expr: openclaw_relay_endpoint_http_healthy == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenClaw Relay endpoint HTTP probe is down"
+          description: "Endpoint {{ $labels.endpoint }} HTTP health has been unhealthy for more than 3 minutes."
+
+      - alert: OpenClawRelayWatchPendingBacklog
+        expr: openclaw_relay_watch_pending_files > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenClaw Relay pending watch backlog"
+          description: "watch_pending_files has stayed above 0 for more than 10 minutes."
+
+      - alert: OpenClawRelayWatchPendingCritical
+        expr: openclaw_relay_watch_pending_files >= 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenClaw Relay pending watch backlog is critical"
+          description: "watch_pending_files has stayed at 5 or more for more than 5 minutes."
+
+      - alert: OpenClawRelayNewDeadletter
+        expr: clamp_min(delta(openclaw_relay_worker_deadletter_total[15m]), 0) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenClaw Relay produced a new deadletter"
+          description: "Worker {{ $labels.worker }} target {{ $labels.target }} deadletter count increased in the last 15 minutes."
+
+      - alert: OpenClawRelayDispatchFailuresBurst
+        expr: clamp_min(delta(openclaw_relay_worker_attempt_total{target="B",result="FAILED"}[15m]), 0) >= 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenClaw Relay dispatch failures are increasing"
+          description: "Worker {{ $labels.worker }} had 3 or more new failed dispatch attempts in the last 15 minutes."
+
+      - alert: OpenClawRelayInjectFailuresBurst
+        expr: clamp_min(delta(openclaw_relay_worker_attempt_total{target="A",result="FAILED"}[15m]), 0) >= 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenClaw Relay inject failures are increasing"
+          description: "Worker {{ $labels.worker }} had 3 or more new failed inject attempts in the last 15 minutes."
+
+      - alert: OpenClawRelayDispatchLatencyHigh
+        expr: (openclaw_relay_worker_latency_sample_count{stage="dispatch"} > 0) and on(worker, stage) (openclaw_relay_worker_latency_seconds{stage="dispatch",stat="latest"} > 120)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenClaw Relay dispatch latency is high"
+          description: "Worker {{ $labels.worker }} latest dispatch latency has stayed above 120 seconds for more than 10 minutes."
+
+      - alert: OpenClawRelayInjectLatencyHigh
+        expr: (openclaw_relay_worker_latency_sample_count{stage="inject"} > 0) and on(worker, stage) (openclaw_relay_worker_latency_seconds{stage="inject",stat="latest"} > 30)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenClaw Relay inject latency is high"
+          description: "Worker {{ $labels.worker }} latest inject latency has stayed above 30 seconds for more than 10 minutes."

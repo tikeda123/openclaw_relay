@@ -1,0 +1,6 @@
+# OpenClaw Relay host aliases
+# Apply these entries to /etc/hosts on the Relay server.
+
+10.0.0.10 optionabc001
+10.0.0.11 optiondef002
+10.0.0.12 relay-node

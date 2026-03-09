@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenClaw Relay service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+WorkingDirectory=/opt/openclaw_relay
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/openclaw_relay/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONPATH=/opt/openclaw_relay/src
+ExecStartPre=/opt/openclaw_relay/.venv/bin/python3 -m openclaw_relay --config /opt/openclaw_relay/config/relay.local.toml check-config
+ExecStart=/opt/openclaw_relay/.venv/bin/python3 -m openclaw_relay --config /opt/openclaw_relay/config/relay.local.toml run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

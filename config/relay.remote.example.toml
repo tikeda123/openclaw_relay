@@ -1,0 +1,88 @@
+# Full example for a 3-node deployment:
+# - Relay host
+# - Control host (OptionABC001 equivalent)
+# - Worker host (OptionDEF002 equivalent)
+
+[source_sync]
+enabled = true
+ssh_host = "control-node"
+ssh_user = "controluser"
+ssh_key_path = "~/.ssh/id_ed25519_control"
+ssh_connect_timeout_seconds = 10
+strict_host_key_checking = true
+remote_path = "/home/controluser/.openclaw/workspace/outbox/pending"
+sync_interval_ms = 5000
+
+[relay]
+node_id = "relay-a"
+state_dir = "../var/lib/openclaw-relay"
+log_dir = "../var/log/openclaw-relay"
+watch_dir = "../var/inbox/pending"
+archive_dir = "../var/archive"
+deadletter_dir = "../var/deadletter"
+poll_interval_ms = 500
+health_host = "127.0.0.1"
+health_port = 18080
+
+[endpoints.a]
+display_name = "ControlGateway"
+base_url = "http://127.0.0.1:31879"
+agent_id = "main"
+default_session_key = "main"
+token_env = "A_GATEWAY_TOKEN"
+timeout_seconds = 30.0
+
+[endpoints.a.tunnel]
+ssh_host = "control-node"
+ssh_user = "controluser"
+ssh_key_path = "~/.ssh/id_ed25519_control"
+ssh_connect_timeout_seconds = 10
+strict_host_key_checking = true
+local_port = 31879
+remote_host = "127.0.0.1"
+remote_port = 18789
+token_config_path = "/home/controluser/.openclaw/openclaw.json"
+
+[routing]
+default_worker = "worker1"
+
+[workers.worker1]
+display_name = "WorkerGateway1"
+base_url = "http://127.0.0.1:31901"
+agent_id = "main"
+default_session_key = "main"
+token_env = "WORKER1_GATEWAY_TOKEN"
+timeout_seconds = 30.0
+
+[workers.worker1.tunnel]
+ssh_host = "worker-node"
+ssh_user = "workeruser"
+ssh_key_path = "~/.ssh/id_ed25519_worker1"
+ssh_connect_timeout_seconds = 10
+strict_host_key_checking = true
+local_port = 31901
+remote_host = "127.0.0.1"
+remote_port = 18789
+token_config_path = "/home/workeruser/.openclaw/openclaw.json"
+
+[retry]
+max_attempts_b = 5
+max_attempts_a = 10
+initial_backoff_ms = 1000
+max_backoff_ms = 30000
+jitter = true
+
+[security]
+require_private_ingress = true
+allow_http_only_for_localhost = true
+mask_secrets_in_logs = true
+
+[audit]
+mode = "preview"
+jsonl_path = "../var/log/openclaw-relay/a2a-audit.jsonl"
+
+[behavior]
+schema_version = "relay-envelope/v1"
+default_ttl_seconds = 300
+duplicate_policy = "suppress"
+inject_notice_on_error = true

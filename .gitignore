@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+build/
+dist/
+*.egg-info/
+
+# local virtualenvs
+.venv/
+venv/
+
+# editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# runtime artifacts
+var/
+config/var/
+
+# local machine configs
+config/*.local.toml
+config/relay.tunnel.local.toml
+
+# local scratch / backups
+*.bak
+*.tmp

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run OpenClaw Relay cleanup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=openclaw-relay-cleanup.service
+
+[Install]
+WantedBy=timers.target

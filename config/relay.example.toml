@@ -1,0 +1,51 @@
+[relay]
+node_id = "relay-a"
+state_dir = "../var/lib/openclaw-relay"
+log_dir = "../var/log/openclaw-relay"
+watch_dir = "../var/inbox/pending"
+archive_dir = "../var/archive"
+deadletter_dir = "../var/deadletter"
+poll_interval_ms = 500
+health_host = "127.0.0.1"
+health_port = 18080
+
+[endpoints.a]
+display_name = "OptionABC001"
+base_url = "http://10.0.0.10:18789"
+agent_id = "orchestrator"
+default_session_key = "main"
+token_env = "A_GATEWAY_TOKEN"
+timeout_seconds = 30.0
+
+[routing]
+default_worker = "def002"
+
+[workers.def002]
+display_name = "OptionDEF002"
+base_url = "http://10.0.0.11:19001"
+agent_id = "worker"
+default_session_key = "main"
+token_env = "B_GATEWAY_TOKEN"
+timeout_seconds = 30.0
+
+[retry]
+max_attempts_b = 5
+max_attempts_a = 10
+initial_backoff_ms = 1000
+max_backoff_ms = 30000
+jitter = true
+
+[security]
+require_private_ingress = true
+allow_http_only_for_localhost = false
+mask_secrets_in_logs = true
+
+[audit]
+mode = "preview"
+jsonl_path = "../var/log/openclaw-relay/a2a-audit.jsonl"
+
+[behavior]
+schema_version = "relay-envelope/v1"
+default_ttl_seconds = 300
+duplicate_policy = "suppress"
+inject_notice_on_error = true
