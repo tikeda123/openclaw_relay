@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenClaw Relay service
+Description=OpenClaw Relay RabbitMQ worker adapter (%i)
 Wants=network-online.target
 After=network-online.target
 
@@ -13,7 +13,7 @@ Environment=PATH=/opt/openclaw_relay/.venv/bin:/usr/local/sbin:/usr/local/bin:/u
 Environment=PYTHONPATH=/opt/openclaw_relay/src
 EnvironmentFile=-/etc/default/openclaw-relay
 ExecStartPre=/opt/openclaw_relay/.venv/bin/python3 -m openclaw_relay --config /opt/openclaw_relay/config/relay.local.toml check-config
-ExecStart=/opt/openclaw_relay/.venv/bin/python3 -m openclaw_relay --config /opt/openclaw_relay/config/relay.local.toml run
+ExecStart=/opt/openclaw_relay/.venv/bin/python3 -m openclaw_relay --config /opt/openclaw_relay/config/relay.local.toml run-rabbitmq-worker-adapter --worker %i
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

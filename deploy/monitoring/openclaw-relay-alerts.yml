@@ -19,15 +19,6 @@ groups:
           summary: "OpenClaw Relay is not ready"
           description: "Relay readiness has been 0 for more than 2 minutes."
 
-      - alert: OpenClawRelaySourceSyncUnhealthy
-        expr: (openclaw_relay_source_sync_enabled == 1) and (openclaw_relay_source_sync_healthy == 0)
-        for: 3m
-        labels:
-          severity: critical
-        annotations:
-          summary: "OpenClaw Relay source sync is unhealthy"
-          description: "source_sync is configured but unhealthy for more than 3 minutes."
-
       - alert: OpenClawRelayTunnelDown
         expr: (openclaw_relay_endpoint_tunnel_configured == 1) and (openclaw_relay_endpoint_tunnel_healthy == 0)
         for: 3m
@@ -90,6 +81,15 @@ groups:
         annotations:
           summary: "OpenClaw Relay inject failures are increasing"
           description: "Worker {{ $labels.worker }} had 3 or more new failed inject attempts in the last 15 minutes."
+
+      - alert: OpenClawRelayMailboxBacklog
+        expr: openclaw_relay_mailbox_queue_depth > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenClaw Relay mailbox queue is backed up"
+          description: "Mailbox {{ $labels.mailbox }} has had pending messages for more than 10 minutes."
 
       - alert: OpenClawRelayDispatchLatencyHigh
         expr: (openclaw_relay_worker_latency_sample_count{stage="dispatch"} > 0) and on(worker, stage) (openclaw_relay_worker_latency_seconds{stage="dispatch",stat="latest"} > 120)

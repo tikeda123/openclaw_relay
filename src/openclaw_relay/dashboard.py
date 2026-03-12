@@ -299,7 +299,7 @@ def render_dashboard_html() -> str:
     <section class="hero">
       <div class="eyebrow">OpenClaw Relay Chat Monitor</div>
       <h1>OptionABC001 と Worker 群の会話</h1>
-      <p>Relay が見ている request と reply を、そのままチャットとして並べます。OptionABC001 と worker のやり取りを優先して出し、最新の動きが先頭に来ます。</p>
+      <p>この画面は Relay transport の request と reply だけを表示します。Telegram の人間会話や session 補助ログはここには出しません。</p>
       <div class="nav">
         <a class="nav-link active" href="/ui">Conversation</a>
         <a class="nav-link" href="/ops">Operations</a>
@@ -315,7 +315,7 @@ def render_dashboard_html() -> str:
 
     <section class="panel">
       <h2>Chat Timeline</h2>
-      <p class="panel-copy">OptionABC001 から worker への dispatch、受理、進行中メモ、reply を最新順で表示します。</p>
+      <p class="panel-copy">OptionABC001 から worker へ送った message と、worker から Relay 経由で返った reply だけを最新順で表示します。</p>
       <div class="filter-row" id="worker-filters"></div>
       <div class="timeline" id="timeline">
         <div class="loading">Loading conversations...</div>
@@ -349,12 +349,26 @@ def render_dashboard_html() -> str:
     };
 
     let selectedWorker = "__all__";
+    let showDeadletters = false;
+
+    const RECENT_DEADLETTER_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+    const isDeadletter = (entry) => String(entry?.status || "").startsWith("DEADLETTER");
+
+    function isArchivedDeadletter(entry, latestTimestamp) {
+      if (!isDeadletter(entry)) return false;
+      const latest = sortKey(latestTimestamp);
+      const current = sortKey(entry?.at);
+      if (!latest || !current) return true;
+      return (latest - current) > RECENT_DEADLETTER_WINDOW_MS;
+    }
 
     function renderTopStrip(data) {
       const metrics = data.metrics;
       const alertSummary = data.alerts?.summary || {};
       const inFlight =
         (metrics.messageStatusCounts.RESERVED || 0) +
+        (metrics.messageStatusCounts.QUEUED_B || 0) +
         (metrics.messageStatusCounts.B_REPLIED || 0) +
         (metrics.messageStatusCounts.FAILED_B || 0) +
         (metrics.messageStatusCounts.FAILED_A_INJECTION || 0);
@@ -411,6 +425,7 @@ def render_dashboard_html() -> str:
         const done = statusCounts.DONE || 0;
         const inFlight =
           (statusCounts.RESERVED || 0) +
+          (statusCounts.QUEUED_B || 0) +
           (statusCounts.B_REPLIED || 0) +
           (statusCounts.FAILED_B || 0) +
           (statusCounts.FAILED_A_INJECTION || 0);
@@ -439,6 +454,13 @@ def render_dashboard_html() -> str:
     function renderWorkerFilters(data) {
       const container = document.getElementById("worker-filters");
       const workers = Array.isArray(data.workers) ? data.workers : [];
+      const timelineSource = Array.isArray(data.timeline) && data.timeline.length
+        ? data.timeline
+        : buildTimeline(data.messages || []);
+      const latestTimestamp = timelineSource.reduce((latest, entry) => {
+        return sortKey(entry?.at) > sortKey(latest) ? entry?.at : latest;
+      }, null);
+      const deadletterCount = timelineSource.filter((entry) => isArchivedDeadletter(entry, latestTimestamp)).length;
       const options = [
         { key: "__all__", label: "All workers" },
         ...workers.map((worker) => ({ key: worker.displayName, label: worker.displayName })),
@@ -446,14 +468,30 @@ def render_dashboard_html() -> str:
       if (!options.some((option) => option.key === selectedWorker)) {
         selectedWorker = "__all__";
       }
-      container.innerHTML = options.map((option) => `
+      const workerButtons = options.map((option) => `
         <button
           type="button"
           class="filter-btn ${option.key === selectedWorker ? "active" : ""}"
           data-worker="${escapeHtml(option.key)}"
         >${escapeHtml(option.label)}</button>
       `).join("");
+      const deadletterToggle = `
+        <button
+          type="button"
+          class="filter-btn ${showDeadletters ? "active" : ""}"
+          data-deadletters="toggle"
+        >${showDeadletters ? "Hide archived deadletters" : `Show archived deadletters (${deadletterCount})`}</button>
+      `;
+      container.innerHTML = workerButtons + deadletterToggle;
       container.querySelectorAll(".filter-btn").forEach((button) => {
+        if (button.dataset.deadletters === "toggle") {
+          button.addEventListener("click", () => {
+            showDeadletters = !showDeadletters;
+            renderWorkerFilters(data);
+            renderTimeline(data);
+          });
+          return;
+        }
         button.addEventListener("click", () => {
           selectedWorker = button.dataset.worker || "__all__";
           renderWorkerFilters(data);
@@ -467,43 +505,43 @@ def render_dashboard_html() -> str:
       for (const message of messages) {
         timeline.push({
           kind: "a",
-          taskId: message.taskId,
+          taskId: message.conversationId || message.taskId,
+          messageId: message.messageId || message.turnId,
           status: message.status,
-          sender: message.fromGateway,
+          sender: message.from || message.fromGateway,
           at: message.createdAt || message.updatedAt,
           body: message.requestBody || "(request body unavailable)",
-          turnId: message.turnId,
         });
 
         if (message.replyText) {
           timeline.push({
             kind: "b",
-            taskId: message.taskId,
+            taskId: message.conversationId || message.taskId,
+            messageId: message.messageId || message.turnId,
             status: message.status,
-            sender: message.toGateway,
+            sender: message.to || message.toGateway,
             at: message.updatedAt,
             body: message.replyText,
-            turnId: message.turnId,
           });
         } else if (message.lastError) {
           timeline.push({
             kind: "relay",
-            taskId: message.taskId,
+            taskId: message.conversationId || message.taskId,
+            messageId: message.messageId || message.turnId,
             status: message.status,
             sender: "Relay",
             at: message.updatedAt,
             body: message.lastError,
-            turnId: message.turnId,
           });
         } else {
           timeline.push({
             kind: "relay",
-            taskId: message.taskId,
+            taskId: message.conversationId || message.taskId,
+            messageId: message.messageId || message.turnId,
             status: message.status,
             sender: "Relay",
             at: message.updatedAt,
-            body: `${message.toGateway || "worker"} からの返答待ちです。`,
-            turnId: message.turnId,
+            body: `${message.to || message.toGateway || "worker"} からの返答待ちです。`,
           });
         }
       }
@@ -516,12 +554,20 @@ def render_dashboard_html() -> str:
       const timelineSource = Array.isArray(data.timeline) && data.timeline.length
         ? data.timeline
         : buildTimeline(data.messages || []);
-      const filteredSource = selectedWorker === "__all__"
+      const workerFiltered = selectedWorker === "__all__"
         ? timelineSource
         : timelineSource.filter((entry) => (entry.worker || entry.sender) === selectedWorker);
+      const latestTimestamp = workerFiltered.reduce((latest, entry) => {
+        return sortKey(entry?.at) > sortKey(latest) ? entry?.at : latest;
+      }, null);
+      const filteredSource = showDeadletters
+        ? workerFiltered
+        : workerFiltered.filter((entry) => !isArchivedDeadletter(entry, latestTimestamp));
       const timeline = [...filteredSource].sort((left, right) => sortKey(right.at) - sortKey(left.at));
       if (!timeline.length) {
-        container.innerHTML = '<div class="loading">会話データがまだありません。</div>';
+        container.innerHTML = showDeadletters
+          ? '<div class="loading">会話データがまだありません。</div>'
+          : '<div class="loading">表示対象の会話はありません。必要なら "Show archived deadletters" を押してください。</div>';
         return;
       }
       container.innerHTML = timeline.map((entry) => `
@@ -532,6 +578,7 @@ def render_dashboard_html() -> str:
                 <span class="sender">${escapeHtml(entry.sender)}</span>
                 ${entry.worker && entry.worker !== entry.sender ? `<span class="task-tag">${escapeHtml(entry.worker)}</span>` : ""}
                 <span class="task-tag">${escapeHtml(entry.taskId)}</span>
+                ${entry.messageId ? `<span class="task-tag">msg:${escapeHtml(entry.messageId)}</span>` : ""}
                 <span class="status-tag">${escapeHtml(entry.status)}</span>
               </div>
               <div>${escapeHtml(fmtDate(entry.at))}</div>
@@ -915,6 +962,7 @@ def render_ops_html() -> str:
       const messageStatus = metrics.messageStatusCounts || {};
       const inFlight =
         (messageStatus.RESERVED || 0) +
+        (messageStatus.QUEUED_B || 0) +
         (messageStatus.B_REPLIED || 0) +
         (messageStatus.FAILED_B || 0) +
         (messageStatus.FAILED_A_INJECTION || 0);
@@ -943,9 +991,9 @@ def render_ops_html() -> str:
           <div class="metric-sub">watch pending ${metrics.watchPendingFiles || 0}</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">source sync</div>
-          <div class="metric-value">${metrics.sourceSyncHealthy ? "OK" : "DOWN"}</div>
-          <div class="metric-sub">enabled ${metrics.sourceSyncEnabled ? "yes" : "no"}</div>
+          <div class="metric-label">mailbox backlog</div>
+          <div class="metric-value">${Object.values(metrics.mailboxQueueDepths || {}).reduce((sum, value) => sum + Number(value || 0), 0)}</div>
+          <div class="metric-sub">delivered ${metrics.mailboxMessageStatusCounts?.delivered || 0}</div>
         </div>
         <div class="metric-card">
           <div class="metric-label">node</div>
@@ -971,6 +1019,7 @@ def render_ops_html() -> str:
         const inject = latency.inject || {};
         const inFlight =
           (status.RESERVED || 0) +
+          (status.QUEUED_B || 0) +
           (status.B_REPLIED || 0) +
           (status.FAILED_B || 0) +
           (status.FAILED_A_INJECTION || 0);
@@ -1037,6 +1086,7 @@ def render_ops_html() -> str:
               <th>Worker</th>
               <th>Done</th>
               <th>Reserved</th>
+              <th>Queued B</th>
               <th>B Replied</th>
               <th>Failed B</th>
               <th>Failed A</th>
@@ -1052,6 +1102,7 @@ def render_ops_html() -> str:
                   <td>${escapeHtml(worker.displayName)}</td>
                   <td>${status.DONE || 0}</td>
                   <td>${status.RESERVED || 0}</td>
+                  <td>${status.QUEUED_B || 0}</td>
                   <td>${status.B_REPLIED || 0}</td>
                   <td>${status.FAILED_B || 0}</td>
                   <td>${status.FAILED_A_INJECTION || 0}</td>
@@ -1078,19 +1129,19 @@ def render_ops_html() -> str:
       container.innerHTML = `
         <table>
           <thead>
-            <tr>
-              <th>Worker</th>
-              <th>Task</th>
-              <th>Status</th>
-              <th>Updated</th>
-              <th>Error</th>
-            </tr>
+              <tr>
+                <th>Worker</th>
+                <th>Conversation</th>
+                <th>Status</th>
+                <th>Updated</th>
+                <th>Error</th>
+              </tr>
           </thead>
           <tbody>
             ${deadletters.map((message) => `
               <tr>
-                <td>${escapeHtml(message.toGateway || message.workerDisplayName || "-")}</td>
-                <td class="mono">${escapeHtml(message.taskId || "-")}</td>
+                <td>${escapeHtml(message.to || message.toGateway || message.workerDisplayName || "-")}</td>
+                <td class="mono">${escapeHtml(message.conversationId || message.taskId || "-")}</td>
                 <td>${escapeHtml(message.status || "-")}</td>
                 <td>${escapeHtml(fmtDate(message.updatedAt))}</td>
                 <td>${escapeHtml(message.lastError || "-")}</td>

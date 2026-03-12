@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.openclaw.relay-mailbox-injector</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>__HOME__/.local/bin/relay-mailbox-injector.py</string>
+      <string>--poll-interval-seconds</string>
+      <string>2</string>
+      <string>--agent-id</string>
+      <string>main</string>
+      <string>--session-key</string>
+      <string>agent:main:main</string>
+      <string>--notify-telegram</string>
+      <string>--verbose</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/openclaw-relay-mailbox-injector.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/openclaw-relay-mailbox-injector.log</string>
+  </dict>
+</plist>

@@ -7,11 +7,15 @@ import socket
 import subprocess
 from typing import Sequence
 
-from openclaw_relay.config import SSHConnectionConfig, SourceSyncConfig, TunnelConfig
+from openclaw_relay.config import SSHConnectionConfig, TunnelConfig
 
 
 class RemoteError(RuntimeError):
     """Raised when an SSH-transported operation fails."""
+
+
+def _py_literal(value: object) -> str:
+    return json.dumps(value, ensure_ascii=True)
 
 
 @dataclass(frozen=True)
@@ -99,48 +103,6 @@ class RemoteTokenResolver:
 
 
 @dataclass(frozen=True)
-class RemoteOutboxSyncer:
-    def sync(self, config: SourceSyncConfig, local_watch_dir: str) -> list[str]:
-        local_path = str(local_watch_dir)
-        ssh_command = [
-            "ssh",
-            "-i",
-            str(config.ssh.key_path),
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            f"ConnectTimeout={config.ssh.connect_timeout_seconds}",
-        ]
-        strict = "yes" if config.ssh.strict_host_key_checking else "no"
-        ssh_command.extend(["-o", f"StrictHostKeyChecking={strict}"])
-
-        result = subprocess.run(
-            [
-                "rsync",
-                "-rt",
-                "--out-format=%n",
-                "--include=*/",
-                "--include=*.json",
-                "--exclude=*",
-                "-e",
-                " ".join(shlex.quote(part) for part in ssh_command),
-                f"{config.ssh.user}@{config.ssh.host}:{config.remote_path.rstrip('/')}/",
-                local_path,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RemoteError(result.stderr.strip() or "rsync failed")
-        return [
-            line.strip()
-            for line in result.stdout.splitlines()
-            if line.strip() and line.strip().endswith(".json")
-        ]
-
-
-@dataclass(frozen=True)
 class RemoteSessionFetcher:
     def fetch_recent_messages(
         self,
@@ -160,11 +122,11 @@ from pathlib import Path
 
 base = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
 sessions_index_path = base / "sessions.json"
-terms = [term.lower() for term in {json.dumps(list(include_terms), ensure_ascii=False)}]
+terms = [term.lower() for term in {_py_literal(list(include_terms))}]
 limit_files = {int(limit_files)}
 limit_messages = {int(limit_messages)}
-node_label = {node_label!r}
-subagent_labels = {list(subagent_labels or [])!r}
+node_label = {_py_literal(node_label)}
+subagent_labels = {_py_literal(list(subagent_labels or []))}
 spawn_calls = {{}}
 tracked_sessions = {{}}
 
@@ -439,6 +401,218 @@ print(json.dumps(entries[-limit_messages:], ensure_ascii=False))
         if not isinstance(payload, list):
             raise RemoteError("remote session fetch returned unexpected payload")
         return [item for item in payload if isinstance(item, dict)]
+
+    def find_message(
+        self,
+        connection: SSHConnectionConfig,
+        *,
+        session_key: str,
+        marker_text: str,
+        limit_files: int = 32,
+    ) -> dict[str, object] | None:
+        runner = SSHRunner(connection)
+        remote_script = f"""
+import json
+from heapq import nlargest
+from pathlib import Path
+
+base = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
+sessions_index_path = base / "sessions.json"
+session_key = {_py_literal(session_key)}
+marker_text = {_py_literal(marker_text)}
+limit_files = {int(limit_files)}
+
+def iter_text_parts(content):
+    if not isinstance(content, list):
+        return
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "text":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            yield text.strip()
+
+def load_sessions_index():
+    if not sessions_index_path.exists():
+        return {{}}
+    try:
+        payload = json.loads(sessions_index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {{}}
+    return payload if isinstance(payload, dict) else {{}}
+
+def candidate_paths():
+    index = load_sessions_index()
+    details = index.get(session_key)
+    preferred = []
+    if isinstance(details, dict):
+        transcript_path = details.get("transcriptPath") or details.get("sessionFile")
+        if isinstance(transcript_path, str) and transcript_path.strip():
+            preferred_path = Path(transcript_path)
+            if preferred_path.exists() and preferred_path.is_file():
+                preferred.append(preferred_path)
+    if preferred:
+        return preferred
+    if not base.exists():
+        return []
+    files = [
+        path for path in base.iterdir()
+        if path.is_file() and (path.name.endswith(".jsonl") or ".jsonl.deleted." in path.name)
+    ]
+    return nlargest(limit_files, files, key=lambda path: path.stat().st_mtime)
+
+for path in candidate_paths():
+    try:
+        handle = path.open("r", encoding="utf-8", errors="ignore")
+    except OSError:
+        continue
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict) or payload.get("type") != "message":
+                continue
+            message = payload.get("message")
+            if not isinstance(message, dict):
+                continue
+            text_parts = list(iter_text_parts(message.get("content")))
+            if not text_parts:
+                continue
+            text = "\\n\\n".join(text_parts).strip()
+            if marker_text in text:
+                print(
+                    json.dumps(
+                        {{
+                            "found": True,
+                            "sessionFile": path.name,
+                            "at": payload.get("timestamp"),
+                            "role": message.get("role"),
+                            "body": text,
+                        }},
+                        ensure_ascii=False,
+                    )
+                )
+                raise SystemExit(0)
+
+print(json.dumps({{"found": False}}, ensure_ascii=False))
+"""
+        result = runner.run("python3 - <<'PY'\n" + remote_script + "\nPY")
+        output = result.stdout.strip()
+        if not output:
+            return None
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise RemoteError("remote session search returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RemoteError("remote session search returned unexpected payload")
+        if payload.get("found") is True:
+            return payload
+        return None
+
+    def find_message_reply(
+        self,
+        connection: SSHConnectionConfig,
+        *,
+        marker_text: str,
+        limit_files: int = 16,
+    ) -> dict[str, object] | None:
+        runner = SSHRunner(connection)
+        remote_script = f"""
+import json
+from heapq import nlargest
+from pathlib import Path
+
+base = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
+marker_text = {_py_literal(marker_text)}
+limit_files = {int(limit_files)}
+
+def iter_text_parts(content):
+    if not isinstance(content, list):
+        return
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "text":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            yield text.strip()
+
+if not base.exists():
+    print(json.dumps({{"found": False}}, ensure_ascii=False))
+    raise SystemExit(0)
+
+files = [
+    path for path in base.iterdir()
+    if path.is_file() and (path.name.endswith(".jsonl") or ".jsonl.deleted." in path.name)
+]
+files = nlargest(limit_files, files, key=lambda path: path.stat().st_mtime)
+
+best_match = None
+for path in files:
+    try:
+        handle = path.open("r", encoding="utf-8", errors="ignore")
+    except OSError:
+        continue
+    matched_request = None
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict) or payload.get("type") != "message":
+                continue
+            message = payload.get("message")
+            if not isinstance(message, dict):
+                continue
+            text_parts = list(iter_text_parts(message.get("content")))
+            if not text_parts:
+                continue
+            text = "\\n\\n".join(text_parts).strip()
+            role = message.get("role")
+            if matched_request is None and role == "user" and marker_text in text:
+                matched_request = {{
+                    "found": True,
+                    "sessionFile": path.name,
+                    "requestAt": payload.get("timestamp"),
+                    "requestBody": text,
+                }}
+                continue
+            if matched_request is not None and role == "assistant":
+                matched_request["replyAt"] = payload.get("timestamp")
+                matched_request["replyText"] = text
+                print(json.dumps(matched_request, ensure_ascii=False))
+                raise SystemExit(0)
+    if matched_request is not None and best_match is None:
+        best_match = matched_request
+
+print(json.dumps(best_match or {{"found": False}}, ensure_ascii=False))
+"""
+        result = runner.run("python3 - <<'PY'\n" + remote_script + "\nPY")
+        output = result.stdout.strip()
+        if not output:
+            return None
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise RemoteError("remote reply search returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RemoteError("remote reply search returned unexpected payload")
+        if payload.get("found") is True:
+            return payload
+        return None
 
 
 def _port_open(host: str, port: int) -> bool:

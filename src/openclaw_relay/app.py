@@ -7,7 +7,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
-import shlex
+import sqlite3
 import threading
 import time
 from collections import deque
@@ -16,16 +16,16 @@ from urllib import request as urllib_request
 
 from openclaw_relay.audit import AuditLogger
 from openclaw_relay.alerts import AlertStore
+from openclaw_relay.broker import RabbitMQBroker, RabbitMQError
 from openclaw_relay.config import AppConfig, ConfigError
 from openclaw_relay.dashboard import render_dashboard_html, render_ops_html
-from openclaw_relay.envelope import Envelope, EnvelopeError
+from openclaw_relay.envelope import Envelope, EnvelopeError, resolve_return_session_key
 from openclaw_relay.health import HealthServer
+from openclaw_relay.rabbitmq_runtime import RabbitMQReply
 from openclaw_relay.remote import (
     RemoteError,
-    RemoteOutboxSyncer,
     RemoteSessionFetcher,
     RemoteTokenResolver,
-    SSHRunner,
     TunnelManager,
 )
 from openclaw_relay.response_extractor import ResponseExtractor, ResponseExtractorError
@@ -48,8 +48,8 @@ class RelayApp:
         response_extractor: ResponseExtractor | None = None,
         tunnel_manager: TunnelManager | None = None,
         remote_token_resolver: RemoteTokenResolver | None = None,
-        remote_outbox_syncer: RemoteOutboxSyncer | None = None,
         remote_session_fetcher: RemoteSessionFetcher | None = None,
+        rabbitmq_broker: RabbitMQBroker | None = None,
     ) -> None:
         self.config = config
         self.logger = logger
@@ -59,7 +59,6 @@ class RelayApp:
         self.response_extractor = response_extractor or ResponseExtractor()
         self.tunnel_manager = tunnel_manager or TunnelManager()
         self.remote_token_resolver = remote_token_resolver or RemoteTokenResolver()
-        self.remote_outbox_syncer = remote_outbox_syncer or RemoteOutboxSyncer()
         self.remote_session_fetcher = remote_session_fetcher or RemoteSessionFetcher()
         self.spool = SpoolWriter(
             processing_dir=config.relay.processing_dir,
@@ -79,10 +78,7 @@ class RelayApp:
         self._last_poll_processed_count = 0
         self._session_cache_generated_at = 0.0
         self._session_cache_entries: list[dict[str, object]] = []
-        self._last_source_sync_at_monotonic = 0.0
         self._last_external_health_check_at_monotonic = 0.0
-        self._source_sync_healthy = config.source_sync is None
-        self._source_sync_last_error: str | None = None
         self._endpoint_tunnel_health = {
             endpoint.name: endpoint.tunnel is None
             for endpoint in self._all_endpoints()
@@ -96,10 +92,21 @@ class RelayApp:
             for endpoint in self._all_endpoints()
         }
         self._alert_store = AlertStore(self.config.relay.state_dir / "alertmanager-alerts.json")
+        self._rabbitmq_broker = rabbitmq_broker
+        if self._rabbitmq_broker is None:
+            self._rabbitmq_broker = (
+                RabbitMQBroker(config)
+                if self.config.transport_mode == "rabbitmq" and self.config.rabbitmq is not None
+                else None
+            )
 
     def initialize(self) -> None:
+        if self.config.transport_mode == "rabbitmq" and self._rabbitmq_broker is None:
+            raise ConfigError("routing.transport='rabbitmq' requires a [rabbitmq] configuration")
+        _validate_mailbox_auth_environment(self.config)
         self._ensure_runtime_dirs()
         self.store.initialize()
+        _ensure_rabbitmq_topology_if_available(self._rabbitmq_broker, self.logger)
         self.logger.info("initialized relay state at %s", self.config.relay.state_dir)
 
     def run(self, *, once: bool = False) -> None:
@@ -116,6 +123,9 @@ class RelayApp:
             dashboard_html=render_dashboard_html(),
             ops_html=render_ops_html(),
             alert_webhook=self.receive_alertmanager_webhook,
+            mailbox_send=self.put_mailbox_message,
+            mailbox_receive=self.get_mailbox_message,
+            mailbox_authenticate=self.authenticate_mailbox_request,
         )
         self._health_server.start()
         self.logger.info(
@@ -159,8 +169,6 @@ class RelayApp:
         for path in self.spool.local_dirs():
             if not os_access_writable(path):
                 return False
-        if self.config.source_sync is not None and not self._source_sync_healthy:
-            return False
         for endpoint in self._all_endpoints():
             if endpoint.tunnel is not None and not self._endpoint_tunnel_health.get(endpoint.name, False):
                 return False
@@ -171,12 +179,13 @@ class RelayApp:
     def poll_once(self) -> int:
         processed_count = 0
         self._refresh_external_health()
-        processed_count += self._sync_source_watch_dir()
         pending_files = self.watcher.list_pending_files()
         for path in pending_files:
             if self._process_pending_file(path):
                 processed_count += 1
         processed_count += self._dispatch_reserved_messages()
+        processed_count += self._consume_rabbitmq_replies()
+        processed_count += self._collect_queued_worker_replies()
         processed_count += self._inject_replied_messages()
         if pending_files:
             self.logger.info(
@@ -209,12 +218,6 @@ class RelayApp:
             "# HELP openclaw_relay_last_poll_processed_count Files and messages processed in last poll.",
             "# TYPE openclaw_relay_last_poll_processed_count gauge",
             f"openclaw_relay_last_poll_processed_count {self._last_poll_processed_count}",
-            "# HELP openclaw_relay_source_sync_enabled Whether source_sync is configured.",
-            "# TYPE openclaw_relay_source_sync_enabled gauge",
-            f"openclaw_relay_source_sync_enabled {1 if snapshot['sourceSyncEnabled'] else 0}",
-            "# HELP openclaw_relay_source_sync_healthy Whether source_sync is currently healthy.",
-            "# TYPE openclaw_relay_source_sync_healthy gauge",
-            f"openclaw_relay_source_sync_healthy {1 if snapshot['sourceSyncHealthy'] else 0}",
         ]
         if self._last_poll_completed_at is not None:
             lines.extend(
@@ -348,6 +351,20 @@ class RelayApp:
             lines.append(
                 f'openclaw_relay_spool_files{{kind="{_prom_label(spool_kind)}"}} {count}'
             )
+        mailbox_status_counts = snapshot.get("mailboxMessageStatusCounts", {})
+        if isinstance(mailbox_status_counts, dict):
+            for status, count in mailbox_status_counts.items():
+                lines.append(
+                    "openclaw_relay_mailbox_message_status_total"
+                    f'{{status="{_prom_label(str(status))}"}} {int(count)}'
+                )
+        mailbox_queue_depths = snapshot.get("mailboxQueueDepths", {})
+        if isinstance(mailbox_queue_depths, dict):
+            for mailbox, count in mailbox_queue_depths.items():
+                lines.append(
+                    "openclaw_relay_mailbox_queue_depth"
+                    f'{{mailbox="{_prom_label(str(mailbox))}"}} {int(count)}'
+                )
         return "\n".join(lines) + "\n"
 
     def metrics_snapshot(self) -> dict[str, object]:
@@ -362,8 +379,6 @@ class RelayApp:
             "uptimeSeconds": max(0.0, time.monotonic() - self._started_at_monotonic),
             "watchPresentFiles": len(self.watcher.list_pending_files()),
             "watchPendingFiles": self._count_pending_watch_files(),
-            "sourceSyncEnabled": self.config.source_sync is not None,
-            "sourceSyncHealthy": self._source_sync_healthy,
             "endpointTunnels": {
                 endpoint.name: endpoint.tunnel is not None
                 for endpoint in self._all_endpoints()
@@ -393,6 +408,8 @@ class RelayApp:
             "workerLatency": worker_latency,
             "alertSummary": alert_snapshot["summary"],
             "lastAlertmanagerWebhookAt": alert_snapshot["lastReceivedAt"],
+            "mailboxMessageStatusCounts": self.store.count_mailbox_messages_by_status(),
+            "mailboxQueueDepths": self.store.count_mailbox_queue_depths(),
         }
 
     def dashboard_payload(self) -> dict[str, object]:
@@ -410,7 +427,8 @@ class RelayApp:
             "metrics": dashboard_metrics,
             "alerts": self._alert_store.snapshot(),
             "workers": self._dashboard_workers(metrics),
-            "timeline": self._dashboard_timeline(limit=80),
+            "timeline": self._relay_timeline_entries(limit=80),
+            "sessionTimeline": self._session_timeline_entries(limit=80),
             "messages": self._recent_messages_payload(limit=12),
             "auditEvents": self._recent_audit_events(limit=24),
             "logTail": self._recent_log_lines(limit=36),
@@ -433,6 +451,132 @@ class RelayApp:
             "critical": snapshot["summary"].get("critical", 0),
             "warning": snapshot["summary"].get("warning", 0),
         }
+
+    def put_mailbox_message(self, payload: dict[str, object]) -> dict[str, object]:
+        normalized_payload = _normalized_mailbox_payload(payload)
+        message_id = str(normalized_payload["messageId"])
+        try:
+            row = self.store.enqueue_mailbox_message(
+                message_id=message_id,
+                conversation_id=str(normalized_payload["conversationId"]),
+                from_mailbox=str(normalized_payload["from"]),
+                to_mailbox=str(normalized_payload["to"]),
+                body=str(normalized_payload["body"]),
+                notify_human=bool(normalized_payload.get("notifyHuman")),
+                in_reply_to=_optional_mailbox_string(normalized_payload, "inReplyTo"),
+                queued_at=str(normalized_payload["queuedAt"]),
+                status="publishing" if self._uses_rabbitmq_transport() else "queued",
+            )
+        except sqlite3.IntegrityError as exc:
+            self.logger.error(
+                "failed to queue mailbox message messageId=%s from=%s to=%s: %s",
+                message_id,
+                normalized_payload["from"],
+                normalized_payload["to"],
+                exc,
+            )
+            raise ValueError(f"messageId {message_id!r} already exists") from exc
+        if self._uses_rabbitmq_transport():
+            if self._rabbitmq_broker is None:
+                raise ConfigError("RabbitMQ transport is enabled but broker is not configured")
+            try:
+                self._rabbitmq_broker.publish_mailbox_message(normalized_payload)
+            except (RabbitMQError, OSError) as exc:
+                self.store.update_mailbox_message_status(
+                    message_id=message_id,
+                    status="failed",
+                )
+                self.logger.error(
+                    "failed to publish mailbox message messageId=%s from=%s to=%s: %s",
+                    message_id,
+                    normalized_payload["from"],
+                    normalized_payload["to"],
+                    exc,
+                )
+                raise
+            updated_row = self.store.update_mailbox_message_status(
+                message_id=message_id,
+                status="queued",
+            )
+            if updated_row is not None:
+                row = updated_row
+        self.audit.append(
+            "mailbox_message_queued",
+            payload={
+                "messageId": row["message_id"],
+                "conversationId": row["conversation_id"],
+                "from": row["from_mailbox"],
+                "to": row["to_mailbox"],
+                "inReplyTo": row["in_reply_to"],
+            },
+        )
+        return _mailbox_row_payload(row)
+
+    def get_mailbox_message(self, mailbox: str) -> dict[str, object] | None:
+        normalized_mailbox = mailbox.strip()
+        if not normalized_mailbox:
+            raise ValueError("mailbox name must be a non-empty string")
+        if self._uses_rabbitmq_transport():
+            if self._rabbitmq_broker is None:
+                raise ConfigError("RabbitMQ transport is enabled but broker is not configured")
+            delivery = self._rabbitmq_broker.consume_mailbox_message(normalized_mailbox)
+            if delivery is None:
+                return None
+            try:
+                message_payload = _mailbox_delivery_payload(
+                    json.loads(delivery.body.decode("utf-8")),
+                    dequeued_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                )
+                row = self.store.update_mailbox_message_status(
+                    message_id=str(message_payload["messageId"]),
+                    status="delivered",
+                    dequeued_at=str(message_payload["dequeuedAt"]),
+                )
+                delivery.ack()
+            except ValueError as exc:
+                delivery.nack(requeue=False)
+                raise RuntimeError(f"invalid mailbox message payload: {exc}") from exc
+            except Exception:
+                delivery.nack(requeue=True)
+                raise
+            payload = _mailbox_row_payload(row) if row is not None else message_payload
+        else:
+            row = self.store.dequeue_mailbox_message(mailbox=normalized_mailbox)
+            if row is None:
+                return None
+            payload = _mailbox_row_payload(row)
+        self.audit.append(
+            "mailbox_message_dequeued",
+            payload={
+                "messageId": payload["messageId"],
+                "conversationId": payload["conversationId"],
+                "from": payload["from"],
+                "to": payload["to"],
+                "mailbox": normalized_mailbox,
+            },
+        )
+        return payload
+
+    def authenticate_mailbox_request(
+        self,
+        method: str,
+        headers: dict[str, str],
+    ) -> str | None:
+        del method
+        mailbox_auth = self.config.mailbox_auth
+        if mailbox_auth is None:
+            return None
+        header_value = _header_value(headers, mailbox_auth.header_name)
+        if header_value is None:
+            raise PermissionError(f"missing {mailbox_auth.header_name} header")
+        token = _extract_mailbox_auth_token(
+            header_value=header_value,
+            expected_scheme=mailbox_auth.scheme,
+        )
+        mailbox = mailbox_auth.resolve_authenticated_mailbox(token)
+        if mailbox is None:
+            raise PermissionError("invalid mailbox credentials")
+        return mailbox
 
     def _dashboard_workers(self, metrics: dict[str, object]) -> list[dict[str, object]]:
         worker_counts = metrics.get("workerStatusCounts", {})
@@ -472,12 +616,6 @@ class RelayApp:
             )
         return result
 
-    def _dashboard_timeline(self, *, limit: int) -> list[dict[str, object]]:
-        entries = self._relay_timeline_entries(limit=max(12, limit))
-        entries.extend(self._session_timeline_entries(limit=max(12, limit)))
-        entries.sort(key=lambda item: _timeline_sort_key(item.get("at")))
-        return entries[-limit:]
-
     def _count_pending_watch_files(self) -> int:
         pending = 0
         for path in self.watcher.list_pending_files():
@@ -500,11 +638,15 @@ class RelayApp:
             messages.append(
                 {
                     "id": row["id"],
+                    "conversationId": request_meta.get("conversationId", row["task_id"]),
+                    "messageId": request_meta.get("messageId", row["turn_id"]),
                     "taskId": row["task_id"],
                     "turnId": row["turn_id"],
                     "idempotencyKey": row["idempotency_key"],
                     "filename": row["filename"],
                     "status": row["status"],
+                    "from": request_meta.get("from", self.config.endpoint_a.display_name),
+                    "to": self._message_worker_display_name(row, request_meta=request_meta),
                     "fromGateway": request_meta.get("fromGateway", self.config.endpoint_a.display_name),
                     "toGateway": self._message_worker_display_name(row, request_meta=request_meta),
                     "workerName": row["worker_name"] or self._message_worker_name(row),
@@ -530,7 +672,11 @@ class RelayApp:
                 {
                     "source": "relay",
                     "kind": "a",
+                    "from": message["from"],
+                    "to": message["to"],
                     "sender": message["fromGateway"],
+                    "conversationId": message["conversationId"],
+                    "messageId": message["messageId"],
                     "taskId": message["taskId"],
                     "status": message["status"],
                     "at": message["createdAt"] or message["updatedAt"],
@@ -543,7 +689,11 @@ class RelayApp:
                     {
                         "source": "relay",
                         "kind": "b",
+                        "from": message["to"],
+                        "to": message["from"],
                         "sender": message["toGateway"],
+                        "conversationId": message["conversationId"],
+                        "messageId": message["messageId"],
                         "taskId": message["taskId"],
                         "status": message["status"],
                         "at": message["updatedAt"],
@@ -557,6 +707,8 @@ class RelayApp:
                         "source": "relay",
                         "kind": "relay",
                         "sender": "Relay",
+                        "conversationId": message["conversationId"],
+                        "messageId": message["messageId"],
                         "taskId": message["taskId"],
                         "status": message["status"],
                         "at": message["updatedAt"],
@@ -596,6 +748,16 @@ class RelayApp:
             self.logger.debug("remote session fetch skipped: %s", exc)
             entries = []
 
+        session_label_by_key: dict[str, str] = {}
+        for entry in entries:
+            text = entry.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            session_key = _extract_session_key(text)
+            label = _extract_session_label(text)
+            if session_key and label:
+                session_label_by_key[session_key] = label
+
         cleaned_entries: list[dict[str, object]] = []
         for entry in entries:
             text = entry.get("text")
@@ -608,13 +770,25 @@ class RelayApp:
             normalized_at = _normalize_timestamp(at)
             if not normalized_at:
                 continue
-            if role != "assistant":
+            internal_child_completion = (
+                isinstance(role, str)
+                and role == "user"
+                and _is_internal_child_completion(text)
+            )
+            if role != "assistant" and not internal_child_completion:
                 continue
             sender = entry.get("sender")
+            if internal_child_completion:
+                sender = _extract_internal_child_task_name(text)
             if not isinstance(sender, str) or not sender.strip():
-                sender = self.config.endpoint_a.display_name if role == "assistant" else "Human"
+                if internal_child_completion:
+                    sender = "Subagent"
+                else:
+                    sender = self.config.endpoint_a.display_name if role == "assistant" else "Human"
             kind = entry.get("kind")
-            if kind not in {"a", "b", "relay"}:
+            if internal_child_completion:
+                kind = "b"
+            elif kind not in {"a", "b", "relay"}:
                 kind = "a" if role == "assistant" else "relay"
             label = entry.get("label")
             worker = self._infer_session_worker(
@@ -626,10 +800,27 @@ class RelayApp:
             fallback_task_id = entry.get("sessionFile")
             if not isinstance(fallback_task_id, str) or not fallback_task_id.strip():
                 fallback_task_id = "session"
-            task_id = _extract_session_task_id(
-                text=text,
-                fallback=label if isinstance(label, str) and label.strip() else fallback_task_id,
+            if internal_child_completion:
+                session_key = _extract_session_key(text)
+                task_id = session_label_by_key.get(session_key or "")
+                if not task_id:
+                    task_id = _extract_session_task_id(
+                        text=text,
+                        fallback=worker if isinstance(worker, str) and worker.strip() else fallback_task_id,
+                        include_task_patterns=True,
+                    )
+            else:
+                task_id = _extract_session_task_id(
+                    text=text,
+                    fallback=label if isinstance(label, str) and label.strip() else fallback_task_id,
+                )
+            body = (
+                _extract_internal_child_result_text(text)
+                if internal_child_completion
+                else _clean_session_text(text)
             )
+            if not body:
+                continue
             cleaned_entries.append(
                 {
                     "source": "session",
@@ -639,7 +830,7 @@ class RelayApp:
                     "taskId": task_id,
                     "status": "SESSION",
                     "at": normalized_at,
-                    "body": _clean_session_text(text),
+                    "body": body,
                 }
             )
 
@@ -648,8 +839,6 @@ class RelayApp:
         return cleaned_entries[-limit:]
 
     def _session_monitor_connection(self):
-        if self.config.source_sync is not None:
-            return self.config.source_sync.ssh
         if self.config.endpoint_a.tunnel is not None:
             return self.config.endpoint_a.tunnel.ssh
         return None
@@ -881,35 +1070,12 @@ class RelayApp:
         ):
             return
 
-        if self.config.source_sync is not None:
-            self._probe_source_sync()
-
         for endpoint in self._all_endpoints():
             tunnel_healthy = self._ensure_endpoint_tunnel(endpoint)
             http_healthy = tunnel_healthy and self._probe_endpoint_http(endpoint)
             self._endpoint_http_health[endpoint.name] = http_healthy
 
         self._last_external_health_check_at_monotonic = now
-
-    def _probe_source_sync(self) -> None:
-        source_sync = self.config.source_sync
-        if source_sync is None:
-            self._source_sync_healthy = True
-            self._source_sync_last_error = None
-            return
-
-        runner = SSHRunner(source_sync.ssh)
-        command = f"test -d {shlex.quote(source_sync.remote_path)}"
-        try:
-            runner.run(command)
-        except RemoteError as exc:
-            self._source_sync_healthy = False
-            self._source_sync_last_error = str(exc)
-            self.logger.warning("source sync health check failed: %s", exc)
-            return
-
-        self._source_sync_healthy = True
-        self._source_sync_last_error = None
 
     def _ensure_endpoint_tunnel(self, endpoint) -> bool:
         tunnel = endpoint.tunnel
@@ -946,37 +1112,6 @@ class RelayApp:
 
         self._endpoint_last_error[endpoint.name] = None
         return True
-
-    def _sync_source_watch_dir(self) -> int:
-        source_sync = self.config.source_sync
-        if source_sync is None:
-            return 0
-        now = time.monotonic()
-        if (
-            self._last_source_sync_at_monotonic
-            and now - self._last_source_sync_at_monotonic < source_sync.sync_interval_ms / 1000.0
-        ):
-            return 0
-        self._last_source_sync_at_monotonic = now
-        try:
-            changed = self.remote_outbox_syncer.sync(source_sync, str(self.config.relay.watch_dir))
-        except RemoteError as exc:
-            self._source_sync_healthy = False
-            self._source_sync_last_error = str(exc)
-            self.logger.error("source sync failed: %s", exc)
-            return 0
-        self._source_sync_healthy = True
-        self._source_sync_last_error = None
-        if changed:
-            self.logger.info("synced %s file(s) from source outbox", len(changed))
-            self.audit.append(
-                "source_sync_completed",
-                payload={
-                    "count": len(changed),
-                    "filenames": changed,
-                },
-            )
-        return len(changed)
 
     def _ensure_runtime_dirs(self) -> None:
         for path in (
@@ -1026,6 +1161,8 @@ class RelayApp:
             envelope = Envelope.from_file(
                 path,
                 expected_schema_version=self.config.behavior.schema_version,
+                default_ttl_seconds=self.config.behavior.default_ttl_seconds,
+                default_from_gateway=self.config.endpoint_a.display_name,
             )
         except EnvelopeError as exc:
             deadletter_path = self.spool.copy_to_deadletter(path, reason=exc.code)
@@ -1075,7 +1212,7 @@ class RelayApp:
                         processing_path,
                     )
                     return True
-                processing_path = self._materialize_processing_copy(path)
+                processing_path = self._materialize_processing_copy(path, envelope=envelope)
                 self.store.update_message_artifact(
                     message_id=reservation.message_id,
                     processing_path=str(processing_path),
@@ -1127,7 +1264,7 @@ class RelayApp:
             return True
 
         try:
-            processing_path = self._materialize_processing_copy(path)
+            processing_path = self._materialize_processing_copy(path, envelope=envelope)
         except OSError as exc:
             self.store.update_message_status(
                 message_id=reservation.message_id,
@@ -1171,11 +1308,17 @@ class RelayApp:
         )
         return True
 
-    def _materialize_processing_copy(self, path: Path) -> Path:
+    def _materialize_processing_copy(self, path: Path, *, envelope: Envelope | None = None) -> Path:
         existing = self.config.relay.processing_dir / path.name
         if existing.exists():
             return existing
-        return self.spool.copy_to_processing(path)
+        processing_path = self.spool.copy_to_processing(path)
+        if envelope is not None:
+            processing_path.write_text(
+                json.dumps(envelope.to_payload(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return processing_path
 
     def _build_source_key(self, path: Path) -> str:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1191,8 +1334,7 @@ class RelayApp:
             if not self._message_due_for_retry(row):
                 continue
 
-            prior_attempts = self.store.count_attempts(message_id=row["id"], target="B")
-            if prior_attempts >= self.config.retry.max_attempts_b:
+            if self._retry_exhausted(message_id=row["id"], target="B"):
                 self._deadletter_message(
                     row=row,
                     source_path=Path(processing_path),
@@ -1207,8 +1349,10 @@ class RelayApp:
                 envelope = Envelope.from_file(
                     Path(processing_path),
                     expected_schema_version=self.config.behavior.schema_version,
+                    default_ttl_seconds=self.config.behavior.default_ttl_seconds,
                 )
                 worker_endpoint = self.config.resolve_worker(envelope.to_gateway)
+                request_content = self._build_b_request_content(envelope)
                 self.store.assign_message_worker(
                     message_id=row["id"],
                     worker_name=worker_endpoint.name,
@@ -1264,6 +1408,52 @@ class RelayApp:
                 )
                 continue
 
+            if self._uses_rabbitmq_transport():
+                try:
+                    publish_summary = self._publish_broker_message(
+                        row=row,
+                        envelope=envelope,
+                        worker_endpoint=worker_endpoint,
+                    )
+                    attempt_no = self.store.record_attempt(
+                        message_id=row["id"],
+                        target="B",
+                        result="SUCCESS",
+                    )
+                    self.store.update_message_status(
+                        message_id=row["id"],
+                        status="QUEUED_B",
+                        error_text=None,
+                        next_attempt_at=None,
+                    )
+                    self.audit.append(
+                        "dispatch_queued",
+                        message_id=row["id"],
+                        payload={
+                            "attemptNo": attempt_no,
+                            "worker": worker_endpoint.display_name,
+                            "exchange": publish_summary["exchange"],
+                            "routingKey": publish_summary["routingKey"],
+                            "replyTo": publish_summary["replyTo"],
+                            "messageId": publish_summary["messageId"],
+                            "conversationId": publish_summary["conversationId"],
+                        },
+                    )
+                    self.logger.info(
+                        "%s queued to broker for %s message=%s",
+                        row["filename"],
+                        worker_endpoint.display_name,
+                        envelope.message_id,
+                    )
+                    dispatched += 1
+                except (RabbitMQError, ConfigError) as exc:
+                    self._schedule_b_retry(
+                        row=row,
+                        error_text=str(exc),
+                    )
+                continue
+
+            prior_attempts = self.store.count_attempts(message_id=row["id"], target="B")
             try:
                 token = self._resolve_endpoint_token(worker_endpoint)
             except ConfigError as exc:
@@ -1274,11 +1464,86 @@ class RelayApp:
                 )
                 continue
 
+            if prior_attempts > 0:
+                observed = self._confirm_b_dispatch_reply(
+                    worker_endpoint=worker_endpoint,
+                    request_content=request_content,
+                )
+                if observed is not None:
+                    reply_text = observed.get("replyText")
+                    if isinstance(reply_text, str) and reply_text.strip():
+                        attempt_no = self.store.record_attempt(
+                            message_id=row["id"],
+                            target="B",
+                            result="SUCCESS",
+                            error_text="confirmed via worker session after prior timeout",
+                        )
+                        response = self._build_session_reply_artifact(
+                            worker_endpoint_name=worker_endpoint.display_name,
+                            envelope=envelope,
+                            reply_text=reply_text,
+                            observed=observed,
+                        )
+                        reply_path = self._write_reply_artifact(
+                            idempotency_key=row["idempotency_key"],
+                            response=response,
+                        )
+                        self.store.update_message_reply(
+                            message_id=row["id"],
+                            reply_path=str(reply_path),
+                            reply_text=reply_text,
+                        )
+                        self.audit.append(
+                            "dispatch_succeeded",
+                            message_id=row["id"],
+                            payload={
+                                "attemptNo": attempt_no,
+                                "worker": worker_endpoint.display_name,
+                                "replyPath": str(reply_path),
+                                "replyTextPreview": reply_text[:200],
+                                "confirmedAt": observed.get("replyAt") or observed.get("requestAt"),
+                                "sessionFile": observed.get("sessionFile"),
+                                "via": "worker-session",
+                            },
+                        )
+                        self.logger.info(
+                            "%s already replied in %s session; marking B_REPLIED",
+                            row["filename"],
+                            worker_endpoint.display_name,
+                        )
+                        dispatched += 1
+                        continue
+
+                    delay = min(5.0, max(self.config.retry.initial_backoff_ms / 1000.0, 1.0))
+                    next_attempt_at = self._future_retry_timestamp(delay)
+                    self.store.update_message_status(
+                        message_id=row["id"],
+                        status="FAILED_B",
+                        error_text="worker accepted request; awaiting reply",
+                        next_attempt_at=next_attempt_at,
+                    )
+                    self.audit.append(
+                        "dispatch_waiting_for_reply",
+                        message_id=row["id"],
+                        payload={
+                            "worker": worker_endpoint.display_name,
+                            "nextAttemptAt": next_attempt_at,
+                            "sessionFile": observed.get("sessionFile"),
+                            "requestAt": observed.get("requestAt"),
+                        },
+                    )
+                    self.logger.info(
+                        "%s already reached %s; waiting for reply before rechecking",
+                        row["filename"],
+                        worker_endpoint.display_name,
+                    )
+                    continue
+
             try:
                 response = self.responses_client.send_user_message(
                     endpoint=worker_endpoint,
                     session_key=worker_endpoint.default_session_key,
-                    content=self._build_b_request_content(envelope),
+                    content=request_content,
                     token=token,
                 )
                 attempt_no = self.store.record_attempt(
@@ -1313,59 +1578,96 @@ class RelayApp:
                 )
                 dispatched += 1
             except (ResponsesClientError, ResponseExtractorError, OSError) as exc:
+                if self._is_timeout_error(exc):
+                    observed = self._confirm_b_dispatch_reply(
+                        worker_endpoint=worker_endpoint,
+                        request_content=request_content,
+                    )
+                    if observed is not None:
+                        reply_text = observed.get("replyText")
+                        if isinstance(reply_text, str) and reply_text.strip():
+                            attempt_no = self.store.record_attempt(
+                                message_id=row["id"],
+                                target="B",
+                                result="SUCCESS",
+                                error_text="timed out but confirmed via worker session",
+                            )
+                            response = self._build_session_reply_artifact(
+                                worker_endpoint_name=worker_endpoint.display_name,
+                                envelope=envelope,
+                                reply_text=reply_text,
+                                observed=observed,
+                            )
+                            reply_path = self._write_reply_artifact(
+                                idempotency_key=row["idempotency_key"],
+                                response=response,
+                            )
+                            self.store.update_message_reply(
+                                message_id=row["id"],
+                                reply_path=str(reply_path),
+                                reply_text=reply_text,
+                            )
+                            self.audit.append(
+                                "dispatch_succeeded",
+                                message_id=row["id"],
+                                payload={
+                                    "attemptNo": attempt_no,
+                                    "worker": worker_endpoint.display_name,
+                                    "replyPath": str(reply_path),
+                                    "replyTextPreview": reply_text[:200],
+                                    "confirmedAt": observed.get("replyAt") or observed.get("requestAt"),
+                                    "sessionFile": observed.get("sessionFile"),
+                                    "via": "worker-session",
+                                    "transportError": str(exc),
+                                },
+                            )
+                            self.logger.warning(
+                                "%s dispatch timed out but reply was confirmed in %s session",
+                                row["filename"],
+                                worker_endpoint.display_name,
+                            )
+                            dispatched += 1
+                            continue
+
+                        delay = min(5.0, max(self.config.retry.initial_backoff_ms / 1000.0, 1.0))
+                        next_attempt_at = self._future_retry_timestamp(delay)
+                        attempt_no = self.store.record_attempt(
+                            message_id=row["id"],
+                            target="B",
+                            result="FAILED",
+                            error_text=str(exc),
+                        )
+                        self.store.update_message_status(
+                            message_id=row["id"],
+                            status="FAILED_B",
+                            error_text="worker accepted request; awaiting reply",
+                            next_attempt_at=next_attempt_at,
+                        )
+                        self.audit.append(
+                            "dispatch_waiting_for_reply",
+                            message_id=row["id"],
+                            payload={
+                                "attemptNo": attempt_no,
+                                "worker": worker_endpoint.display_name,
+                                "nextAttemptAt": next_attempt_at,
+                                "sessionFile": observed.get("sessionFile"),
+                                "requestAt": observed.get("requestAt"),
+                                "transportError": str(exc),
+                            },
+                        )
+                        self.logger.warning(
+                            "%s dispatch timed out after delivery to %s; waiting for reply",
+                            row["filename"],
+                            worker_endpoint.display_name,
+                        )
+                        continue
                 if self._should_refresh_token(exc):
                     self._invalidate_endpoint_token(worker_endpoint.name)
                     self.logger.warning(
                         "invalidated cached token for %s after auth failure",
                         worker_endpoint.display_name,
                     )
-                attempt_no = self.store.record_attempt(
-                    message_id=row["id"],
-                    target="B",
-                    result="FAILED",
-                    error_text=str(exc),
-                )
-                if attempt_no >= self.config.retry.max_attempts_b:
-                    self._deadletter_message(
-                        row=row,
-                        source_path=Path(processing_path),
-                        status="DEADLETTER_B",
-                        reason="failed_b",
-                        target="B",
-                        error_text=str(exc),
-                    )
-                    self.logger.error("failed dispatch for %s: %s", row["filename"], exc)
-                    continue
-
-                delay = self._retry_delay_seconds(
-                    message_id=row["id"],
-                    target="B",
-                    attempt_no=attempt_no,
-                )
-                next_attempt_at = self._future_retry_timestamp(delay)
-                self.store.update_message_status(
-                    message_id=row["id"],
-                    status="FAILED_B",
-                    error_text=str(exc),
-                    next_attempt_at=next_attempt_at,
-                )
-                self.audit.append(
-                    "dispatch_retry_scheduled",
-                    message_id=row["id"],
-                    payload={
-                        "attemptNo": attempt_no,
-                        "delaySeconds": delay,
-                        "nextAttemptAt": next_attempt_at,
-                        "error": str(exc),
-                    },
-                )
-                self.logger.warning(
-                    "dispatch attempt %s for %s failed; next retry at %s: %s",
-                    attempt_no,
-                    row["filename"],
-                    next_attempt_at,
-                    exc,
-                )
+                self._schedule_b_retry(row=row, error_text=str(exc))
         return dispatched
 
     def _inject_replied_messages(self) -> int:
@@ -1384,7 +1686,64 @@ class RelayApp:
             if not self._message_due_for_retry(row):
                 continue
 
+            try:
+                envelope = Envelope.from_file(
+                    Path(processing_path),
+                    expected_schema_version=self.config.behavior.schema_version,
+                    default_ttl_seconds=self.config.behavior.default_ttl_seconds,
+                )
+                worker_endpoint = self.config.resolve_worker(envelope.to_gateway)
+                inject_content = self._build_a_inject_content(
+                    envelope,
+                    reply_text,
+                    worker_endpoint.display_name,
+                )
+            except (EnvelopeError, ConfigError) as exc:
+                source_path = Path(row["reply_path"] or processing_path)
+                self._deadletter_message(
+                    row=row,
+                    source_path=source_path,
+                    status="DEADLETTER_A",
+                    reason="failed_a_injection",
+                    target="A",
+                    error_text=str(exc),
+                )
+                self.logger.error("failed inject for %s: %s", row["filename"], exc)
+                continue
+
             prior_attempts = self.store.count_attempts(message_id=row["id"], target="A")
+            if prior_attempts > 0:
+                delivered = self._confirm_a_injection_delivery(
+                    envelope=envelope,
+                    inject_content=inject_content,
+                )
+                if delivered is not None:
+                    attempt_no = self.store.record_attempt(
+                        message_id=row["id"],
+                        target="A",
+                        result="SUCCESS",
+                        error_text="confirmed via session log after prior timeout",
+                    )
+                    self.store.update_message_status(message_id=row["id"], status="DONE")
+                    self.audit.append(
+                        "inject_timeout_confirmed",
+                        message_id=row["id"],
+                        payload={
+                            "attemptNo": attempt_no,
+                            "sessionKey": envelope.return_session_key,
+                            "confirmedAt": delivered.get("at"),
+                            "sessionFile": delivered.get("sessionFile"),
+                        },
+                    )
+                    self.logger.info(
+                        "%s already present in %s session=%s; marking DONE",
+                        row["filename"],
+                        self.config.endpoint_a.display_name,
+                        envelope.return_session_key,
+                    )
+                    injected += 1
+                    continue
+
             if prior_attempts >= self.config.retry.max_attempts_a:
                 source_path = Path(row["reply_path"] or processing_path)
                 self._deadletter_message(
@@ -1398,19 +1757,10 @@ class RelayApp:
                 continue
 
             try:
-                envelope = Envelope.from_file(
-                    Path(processing_path),
-                    expected_schema_version=self.config.behavior.schema_version,
-                )
-                worker_endpoint = self.config.resolve_worker(envelope.to_gateway)
                 self.responses_client.send_user_message(
                     endpoint=self.config.endpoint_a,
                     session_key=envelope.return_session_key,
-                    content=self._build_a_inject_content(
-                        envelope,
-                        reply_text,
-                        worker_endpoint.display_name,
-                    ),
+                    content=inject_content,
                     token=token,
                 )
                 attempt_no = self.store.record_attempt(
@@ -1434,7 +1784,38 @@ class RelayApp:
                     envelope.return_session_key,
                 )
                 injected += 1
-            except (EnvelopeError, ResponsesClientError, OSError) as exc:
+            except (ResponsesClientError, OSError) as exc:
+                if self._is_timeout_error(exc):
+                    delivered = self._confirm_a_injection_delivery(
+                        envelope=envelope,
+                        inject_content=inject_content,
+                    )
+                    if delivered is not None:
+                        attempt_no = self.store.record_attempt(
+                            message_id=row["id"],
+                            target="A",
+                            result="SUCCESS",
+                            error_text="timed out but confirmed via session log",
+                        )
+                        self.store.update_message_status(message_id=row["id"], status="DONE")
+                        self.audit.append(
+                            "inject_timeout_confirmed",
+                            message_id=row["id"],
+                            payload={
+                                "attemptNo": attempt_no,
+                                "sessionKey": envelope.return_session_key,
+                                "confirmedAt": delivered.get("at"),
+                                "sessionFile": delivered.get("sessionFile"),
+                                "transportError": str(exc),
+                            },
+                        )
+                        self.logger.warning(
+                            "%s inject timed out but delivery was confirmed in session=%s",
+                            row["filename"],
+                            envelope.return_session_key,
+                        )
+                        injected += 1
+                        continue
                 if self._should_refresh_token(exc):
                     self._invalidate_endpoint_token(self.config.endpoint_a.name)
                     self.logger.warning(
@@ -1491,13 +1872,339 @@ class RelayApp:
                 )
         return injected
 
+    def _consume_rabbitmq_replies(self) -> int:
+        if not self._uses_rabbitmq_transport() or self._rabbitmq_broker is None:
+            return 0
+
+        consumed = 0
+        reply_binding = self._rabbitmq_broker.relay_reply_binding()
+        while True:
+            delivery = self._rabbitmq_broker.consume_one(reply_binding.queue)
+            if delivery is None:
+                return consumed
+            try:
+                reply_payload = json.loads(delivery.body.decode("utf-8"))
+                reply = RabbitMQReply.from_payload(reply_payload)
+                message_row = self.store.get_message_by_turn_id(reply.message_id)
+                if message_row is None:
+                    message_row = self.store.get_message_by_idempotency_key(reply.message_id)
+                if message_row is None:
+                    self.logger.warning(
+                        "dropping RabbitMQ reply for unknown messageId=%s conversationId=%s",
+                        reply.message_id,
+                        reply.conversation_id,
+                    )
+                    delivery.ack()
+                    consumed += 1
+                    continue
+                if message_row["status"] in {"B_REPLIED", "DONE", "DEADLETTER_A", "DEADLETTER_B"}:
+                    delivery.ack()
+                    consumed += 1
+                    continue
+                if reply.status == "ok" and isinstance(reply.reply_text, str) and reply.reply_text.strip():
+                    reply_artifact = self._build_rabbitmq_reply_artifact(reply)
+                    reply_path = self._write_reply_artifact(
+                        idempotency_key=message_row["idempotency_key"],
+                        response=reply_artifact,
+                    )
+                    self.store.update_message_reply(
+                        message_id=message_row["id"],
+                        reply_path=str(reply_path),
+                        reply_text=reply.reply_text,
+                    )
+                    self.audit.append(
+                        "reply_received",
+                        message_id=message_row["id"],
+                        payload={
+                            "worker": reply.from_gateway,
+                            "replyPath": str(reply_path),
+                            "messageId": reply.message_id,
+                            "conversationId": reply.conversation_id,
+                            "replyTextPreview": reply.reply_text[:200],
+                        },
+                    )
+                    self.logger.info(
+                        "reply received from %s for message=%s",
+                        reply.from_gateway,
+                        reply.message_id,
+                    )
+                    delivery.ack()
+                    consumed += 1
+                    continue
+
+                error_text = reply.error_text or "worker returned an error reply"
+                attempt_no = self.store.record_attempt(
+                    message_id=message_row["id"],
+                    target="B",
+                    result="FAILED",
+                    error_text=error_text,
+                )
+                if self._retry_exhausted(message_id=message_row["id"], target="B"):
+                    self._deadletter_message(
+                        row=message_row,
+                        source_path=Path(message_row["processing_path"]),
+                        status="DEADLETTER_B",
+                        reason="failed_b",
+                        target="B",
+                        error_text=error_text,
+                    )
+                    self.logger.error(
+                        "worker reply marked deadletter for %s: %s",
+                        message_row["filename"],
+                        error_text,
+                    )
+                else:
+                    delay = self._retry_delay_seconds(
+                        message_id=message_row["id"],
+                        target="B",
+                        attempt_no=attempt_no,
+                    )
+                    next_attempt_at = self._future_retry_timestamp(delay)
+                    self.store.update_message_status(
+                        message_id=message_row["id"],
+                        status="FAILED_B",
+                        error_text=error_text,
+                        next_attempt_at=next_attempt_at,
+                    )
+                    self.audit.append(
+                        "reply_error_retry_scheduled",
+                        message_id=message_row["id"],
+                        payload={
+                            "attemptNo": attempt_no,
+                            "delaySeconds": delay,
+                            "nextAttemptAt": next_attempt_at,
+                            "error": error_text,
+                            "worker": reply.from_gateway,
+                        },
+                    )
+                    self.logger.warning(
+                        "worker error reply for %s; next retry at %s: %s",
+                        message_row["filename"],
+                        next_attempt_at,
+                        error_text,
+                    )
+                delivery.ack()
+                consumed += 1
+            except (ValueError, RabbitMQError, OSError) as exc:
+                self.logger.error("failed to process RabbitMQ reply: %s", exc)
+                delivery.nack(requeue=True)
+                return consumed
+
+    def _collect_queued_worker_replies(self) -> int:
+        if not self._uses_rabbitmq_transport():
+            return 0
+
+        collected = 0
+        for row in self.store.list_messages_by_status(("QUEUED_B",)):
+            processing_path = row["processing_path"]
+            if not processing_path:
+                continue
+            try:
+                envelope = Envelope.from_file(
+                    Path(processing_path),
+                    expected_schema_version=self.config.behavior.schema_version,
+                    default_ttl_seconds=self.config.behavior.default_ttl_seconds,
+                )
+                worker_endpoint = self.config.resolve_worker(
+                    row["worker_display_name"] or row["worker_name"] or envelope.to_gateway
+                )
+            except (EnvelopeError, ConfigError, OSError) as exc:
+                self.logger.debug(
+                    "queued reply collection skipped for %s: %s",
+                    row["filename"],
+                    exc,
+                )
+                continue
+
+            observed = self._confirm_b_dispatch_reply(
+                worker_endpoint=worker_endpoint,
+                request_content=envelope.body,
+            )
+            if observed is None:
+                continue
+
+            reply_text = observed.get("replyText")
+            if not isinstance(reply_text, str) or not reply_text.strip():
+                continue
+
+            reply_artifact = self._build_session_reply_artifact(
+                worker_endpoint_name=worker_endpoint.display_name,
+                envelope=envelope,
+                reply_text=reply_text,
+                observed=observed,
+            )
+            reply_path = self._write_reply_artifact(
+                idempotency_key=row["idempotency_key"],
+                response=reply_artifact,
+            )
+            self.store.update_message_reply(
+                message_id=row["id"],
+                reply_path=str(reply_path),
+                reply_text=reply_text,
+            )
+            self.audit.append(
+                "reply_received",
+                message_id=row["id"],
+                payload={
+                    "worker": worker_endpoint.display_name,
+                    "replyPath": str(reply_path),
+                    "messageId": envelope.message_id,
+                    "conversationId": envelope.conversation_id,
+                    "replyTextPreview": reply_text[:200],
+                    "confirmedAt": observed.get("replyAt") or observed.get("requestAt"),
+                    "sessionFile": observed.get("sessionFile"),
+                    "via": "worker-session",
+                },
+            )
+            self.logger.info(
+                "reply collected from %s session for message=%s",
+                worker_endpoint.display_name,
+                envelope.message_id,
+            )
+            collected += 1
+        return collected
+
+    def _uses_rabbitmq_transport(self) -> bool:
+        return self.config.transport_mode == "rabbitmq"
+
+    def _publish_broker_message(
+        self,
+        *,
+        row,
+        envelope: Envelope,
+        worker_endpoint,
+    ) -> dict[str, object]:
+        if self._rabbitmq_broker is None:
+            raise ConfigError("RabbitMQ transport is enabled but broker is not configured")
+        payload = envelope.to_payload()
+        payload["toGateway"] = worker_endpoint.display_name
+        payload["fromGateway"] = self.config.endpoint_a.display_name
+        return self._rabbitmq_broker.publish_message(payload)
+
+    def _schedule_b_retry(self, *, row, error_text: str) -> None:
+        attempt_no = self.store.record_attempt(
+            message_id=row["id"],
+            target="B",
+            result="FAILED",
+            error_text=error_text,
+        )
+        if self._retry_exhausted(message_id=row["id"], target="B"):
+            self._deadletter_message(
+                row=row,
+                source_path=Path(row["processing_path"]),
+                status="DEADLETTER_B",
+                reason="failed_b",
+                target="B",
+                error_text=error_text,
+            )
+            self.logger.error("failed dispatch for %s: %s", row["filename"], error_text)
+            return
+
+        delay = self._retry_delay_seconds(
+            message_id=row["id"],
+            target="B",
+            attempt_no=attempt_no,
+        )
+        next_attempt_at = self._future_retry_timestamp(delay)
+        self.store.update_message_status(
+            message_id=row["id"],
+            status="FAILED_B",
+            error_text=error_text,
+            next_attempt_at=next_attempt_at,
+        )
+        self.audit.append(
+            "dispatch_retry_scheduled",
+            message_id=row["id"],
+            payload={
+                "attemptNo": attempt_no,
+                "delaySeconds": delay,
+                "nextAttemptAt": next_attempt_at,
+                "error": error_text,
+            },
+        )
+        self.logger.warning(
+            "dispatch attempt %s for %s failed; next retry at %s: %s",
+            attempt_no,
+            row["filename"],
+            next_attempt_at,
+            error_text,
+        )
+
+    def _retry_exhausted(self, *, message_id: int, target: str) -> bool:
+        failed_attempts = self.store.count_attempts_by_result(
+            message_id=message_id,
+            target=target,
+            result="FAILED",
+        )
+        limit = (
+            self.config.retry.max_attempts_b
+            if target == "B"
+            else self.config.retry.max_attempts_a
+        )
+        return failed_attempts >= limit
+
+    def _build_rabbitmq_reply_artifact(self, reply: RabbitMQReply) -> dict[str, object]:
+        return {
+            "id": f"rabbitmq:{reply.message_id}",
+            "object": "response",
+            "status": "completed" if reply.status == "ok" else "failed",
+            "model": f"openclaw:{reply.from_gateway}",
+            "source": "rabbitmq-reply-queue",
+            "replyStatus": reply.status,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": reply.reply_text or reply.error_text or "",
+                        }
+                    ],
+                    "status": "completed" if reply.status == "ok" else "failed",
+                }
+            ],
+        }
+
     def _build_b_request_content(self, envelope: Envelope) -> str:
         return (
             f"[FROM {envelope.from_gateway}]"
-            f"[TASK {envelope.task_id}]"
-            f"[INTENT {envelope.intent}]\n"
+            f"[MESSAGE {envelope.message_id}]"
+            f"[CONVERSATION {envelope.conversation_id}]\n"
             f"{envelope.body}"
         )
+
+    def _build_session_reply_artifact(
+        self,
+        *,
+        worker_endpoint_name: str,
+        envelope: Envelope,
+        reply_text: str,
+        observed: dict[str, object],
+    ) -> dict[str, object]:
+        return {
+            "id": f"session-log:{envelope.message_id}",
+            "object": "response",
+            "status": "completed",
+            "model": f"openclaw:{worker_endpoint_name}",
+            "source": "worker-session-log",
+            "sessionFile": observed.get("sessionFile"),
+            "requestAt": observed.get("requestAt"),
+            "replyAt": observed.get("replyAt"),
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": reply_text,
+                        }
+                    ],
+                    "status": "completed",
+                }
+            ],
+        }
 
     def _build_a_inject_content(
         self,
@@ -1507,9 +2214,57 @@ class RelayApp:
     ) -> str:
         return (
             f"[Reply from {worker_display_name}]"
-            f"[TASK {envelope.task_id}]\n"
+            f"[MESSAGE {envelope.message_id}]"
+            f"[CONVERSATION {envelope.conversation_id}]\n"
             f"{reply_text}"
         )
+
+    def _confirm_a_injection_delivery(
+        self,
+        *,
+        envelope: Envelope,
+        inject_content: str,
+    ) -> dict[str, object] | None:
+        connection = self._session_monitor_connection()
+        if connection is None:
+            return None
+        try:
+            return self.remote_session_fetcher.find_message(
+                connection,
+                session_key=envelope.return_session_key,
+                marker_text=inject_content,
+            )
+        except RemoteError as exc:
+            self.logger.debug(
+                "remote inject confirmation skipped for session=%s: %s",
+                envelope.return_session_key,
+                exc,
+            )
+            return None
+
+    def _confirm_b_dispatch_reply(
+        self,
+        *,
+        worker_endpoint,
+        request_content: str,
+    ) -> dict[str, object] | None:
+        if worker_endpoint.tunnel is None:
+            return None
+        try:
+            return self.remote_session_fetcher.find_message_reply(
+                worker_endpoint.tunnel.ssh,
+                marker_text=request_content,
+            )
+        except RemoteError as exc:
+            self.logger.debug(
+                "remote worker reply confirmation skipped for %s: %s",
+                worker_endpoint.display_name,
+                exc,
+            )
+            return None
+
+    def _is_timeout_error(self, exc: BaseException) -> bool:
+        return "timed out" in str(exc).lower()
 
     def _write_reply_artifact(self, *, idempotency_key: str, response: dict[str, object]) -> Path:
         path = self.config.relay.replies_dir / f"{idempotency_key}.json"
@@ -1665,11 +2420,207 @@ def _load_request_metadata(processing_path: str | None) -> dict[str, object]:
     if not isinstance(raw, dict):
         return {}
     result: dict[str, object] = {}
-    for key in ("fromGateway", "toGateway", "intent", "body", "returnSessionKey"):
+    for key in (
+        "from",
+        "fromGateway",
+        "to",
+        "toGateway",
+        "intent",
+        "body",
+        "conversationId",
+        "messageId",
+    ):
         value = raw.get(key)
         if isinstance(value, str) and value.strip():
             result[key] = value
+    if "conversationId" not in result:
+        fallback = raw.get("taskId")
+        if isinstance(fallback, str) and fallback.strip():
+            result["conversationId"] = fallback
+    if "from" not in result and isinstance(result.get("fromGateway"), str):
+        result["from"] = result["fromGateway"]
+    if "fromGateway" not in result and isinstance(result.get("from"), str):
+        result["fromGateway"] = result["from"]
+    if "to" not in result and isinstance(result.get("toGateway"), str):
+        result["to"] = result["toGateway"]
+    if "toGateway" not in result and isinstance(result.get("to"), str):
+        result["toGateway"] = result["to"]
+    if "messageId" not in result:
+        fallback = raw.get("turnId")
+        if isinstance(fallback, str) and fallback.strip():
+            result["messageId"] = fallback
+    requested_return_session_key = raw.get("returnSessionKey")
+    if isinstance(requested_return_session_key, str) and requested_return_session_key.strip():
+        result["requestedReturnSessionKey"] = requested_return_session_key.strip()
+    to_gateway = result.get("toGateway")
+    conversation_id = result.get("conversationId") or result.get("messageId")
+    if isinstance(to_gateway, str) and isinstance(conversation_id, str):
+        result["returnSessionKey"] = resolve_return_session_key(
+            requested_return_session_key if isinstance(requested_return_session_key, str) else None,
+            to_gateway=to_gateway,
+            conversation_id=conversation_id,
+        )
     return result
+
+
+def _required_mailbox_field(
+    payload: dict[str, object],
+    key: str,
+    *,
+    fallback_key: str | None = None,
+) -> str:
+    candidates = [key]
+    if fallback_key is not None:
+        candidates.append(fallback_key)
+    for candidate in candidates:
+        value = payload.get(candidate)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raise ValueError(f"missing or invalid string field '{key}'")
+
+
+def _optional_mailbox_string(payload: dict[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _optional_mailbox_bool(payload: dict[str, object], key: str) -> bool | None:
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return None
+
+
+def _header_value(headers: dict[str, str], header_name: str) -> str | None:
+    expected = header_name.casefold()
+    for key, value in headers.items():
+        if key.casefold() == expected and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_mailbox_auth_token(*, header_value: str, expected_scheme: str) -> str:
+    parts = header_value.strip().split(None, 1)
+    if len(parts) != 2:
+        raise PermissionError("invalid authorization header")
+    scheme, token = parts
+    if scheme.casefold() != expected_scheme.casefold():
+        raise PermissionError("invalid authorization scheme")
+    token = token.strip()
+    if not token:
+        raise PermissionError("missing authorization token")
+    return token
+
+
+def _normalized_mailbox_payload(payload: dict[str, object]) -> dict[str, object]:
+    sender = _required_mailbox_field(payload, "from", fallback_key="fromGateway")
+    recipient = _required_mailbox_field(payload, "to", fallback_key="toGateway")
+    body = _required_mailbox_field(payload, "body")
+    raw_message_id = payload.get("messageId")
+    message_id = (
+        str(raw_message_id).strip()
+        if isinstance(raw_message_id, str) and raw_message_id.strip()
+        else _generate_mailbox_message_id(
+            sender=sender,
+            recipient=recipient,
+            body=body,
+        )
+    )
+    raw_conversation_id = payload.get("conversationId")
+    conversation_id = (
+        str(raw_conversation_id).strip()
+        if isinstance(raw_conversation_id, str) and raw_conversation_id.strip()
+        else message_id
+    )
+    raw_queued_at = payload.get("queuedAt")
+    queued_at = (
+        str(raw_queued_at).strip()
+        if isinstance(raw_queued_at, str) and raw_queued_at.strip()
+        else datetime.now(timezone.utc).isoformat(timespec="seconds")
+    )
+    result: dict[str, object] = {
+        "messageId": message_id,
+        "conversationId": conversation_id,
+        "from": sender,
+        "to": recipient,
+        "body": body,
+        "queuedAt": queued_at,
+        "notifyHuman": _optional_mailbox_bool(payload, "notifyHuman") is True,
+    }
+    in_reply_to = _optional_mailbox_string(payload, "inReplyTo")
+    if in_reply_to is not None:
+        result["inReplyTo"] = in_reply_to
+    return result
+
+
+def _generate_mailbox_message_id(*, sender: str, recipient: str, body: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    entropy = f"{time.time_ns()}:{sender}:{recipient}:{body}"
+    digest = hashlib.sha1(entropy.encode("utf-8")).hexdigest()[:10]
+    return f"MSG-mailbox-{timestamp}-{digest}"
+
+
+def _mailbox_delivery_payload(raw_payload: object, *, dequeued_at: str) -> dict[str, object]:
+    if not isinstance(raw_payload, dict):
+        raise ValueError("mailbox message must be a JSON object")
+    payload = _normalized_mailbox_payload(raw_payload)
+    payload["status"] = "delivered"
+    payload["dequeuedAt"] = dequeued_at
+    return payload
+
+
+def _mailbox_row_payload(row) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "messageId": row["message_id"],
+        "conversationId": row["conversation_id"],
+        "from": row["from_mailbox"],
+        "to": row["to_mailbox"],
+        "body": row["body"],
+        "queuedAt": row["queued_at"],
+        "status": row["status"],
+        "notifyHuman": bool(row["notify_human"]),
+    }
+    if row["in_reply_to"]:
+        payload["inReplyTo"] = row["in_reply_to"]
+    if row["dequeued_at"]:
+        payload["dequeuedAt"] = row["dequeued_at"]
+    return payload
+
+
+def _ensure_rabbitmq_topology_if_available(
+    broker: object | None,
+    logger: logging.Logger,
+) -> None:
+    if broker is None:
+        return
+    ensure_topology = getattr(broker, "ensure_topology", None)
+    if not callable(ensure_topology):
+        return
+    ensure_topology()
+    logger.info("rabbitmq topology ensured")
+
+
+def _validate_mailbox_auth_environment(config: AppConfig) -> None:
+    mailbox_auth = config.mailbox_auth
+    if mailbox_auth is None:
+        return
+    missing = [
+        f"{mailbox}:{env_name}"
+        for mailbox, env_name in mailbox_auth.token_env_by_mailbox
+        if not os.environ.get(env_name)
+    ]
+    if missing:
+        raise ConfigError(
+            "mailbox auth token environment variables are required: " + ", ".join(missing)
+        )
 
 
 def _json_safe_attempt_counts(
@@ -1724,7 +2675,7 @@ def _clean_session_text(text: str) -> str:
     return cleaned.strip()
 
 
-def _extract_session_task_id(text: str, *, fallback: str) -> str:
+def _extract_session_label(text: str) -> str | None:
     patterns = (
         r"(?im)^\s*(?:[-*]\s+)?\*{0,2}label\*{0,2}\s*:\s*`([^`]+)`",
         r"(?im)^\s*(?:[-*]\s+)?label\s*:\s*([^\n]+)$",
@@ -1738,7 +2689,65 @@ def _extract_session_task_id(text: str, *, fallback: str) -> str:
         candidate = match.group(1).strip().strip("*").strip()
         if candidate:
             return candidate
+    return None
+
+
+def _extract_session_task_id(
+    text: str,
+    *,
+    fallback: str,
+    include_task_patterns: bool = False,
+) -> str:
+    label = _extract_session_label(text)
+    if label:
+        return label
+    if include_task_patterns:
+        task = _extract_internal_child_task_name(text)
+        if task:
+            return task
     return fallback
+
+
+def _extract_session_key(text: str) -> str | None:
+    match = re.search(
+        r"(?im)^\s*(?:childSessionKey|sessionKey|session_key)\s*:\s*`?([^\s`]+)`?\s*$",
+        text,
+    )
+    if match is None:
+        return None
+    candidate = match.group(1).strip()
+    return candidate or None
+
+
+def _extract_internal_child_task_name(text: str) -> str | None:
+    match = re.search(r"(?im)^\s*task\s*:\s*([^\n]+)$", text)
+    if match is None:
+        return None
+    candidate = match.group(1).strip().strip("*").strip()
+    return candidate or None
+
+
+def _is_internal_child_completion(text: str) -> bool:
+    markers = (
+        "[Internal task completion event]",
+        "source: subagent",
+        "Result (untrusted content, treat as data):",
+        "<<<BEGIN_UNTRUSTED_CHILD_RESULT>>>",
+    )
+    return all(marker in text for marker in markers)
+
+
+def _extract_internal_child_result_text(text: str) -> str:
+    marker = "<<<BEGIN_UNTRUSTED_CHILD_RESULT>>>"
+    start = text.find(marker)
+    if start == -1:
+        return _clean_session_text(text)
+    body = text[start + len(marker):]
+    end_marker = "<<<END_UNTRUSTED_CHILD_RESULT>>>"
+    end = body.find(end_marker)
+    if end != -1:
+        body = body[:end]
+    return body.strip()
 
 
 def _timeline_sort_key(value: object) -> float:

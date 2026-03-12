@@ -13,19 +13,28 @@ health_port = 18080
 display_name = "OptionABC001"
 base_url = "http://10.0.0.10:18789"
 agent_id = "orchestrator"
-default_session_key = "main"
+default_session_key = "agent:main:main"
 token_env = "A_GATEWAY_TOKEN"
 timeout_seconds = 30.0
 
 [routing]
 default_worker = "def002"
+transport = "responses"
 
 [workers.def002]
 display_name = "OptionDEF002"
 base_url = "http://10.0.0.11:19001"
 agent_id = "worker"
-default_session_key = "main"
+default_session_key = "agent:main:main"
 token_env = "B_GATEWAY_TOKEN"
+timeout_seconds = 30.0
+
+[workers.ghi003]
+display_name = "OptionGHI003"
+base_url = "http://10.0.0.12:19001"
+agent_id = "worker"
+default_session_key = "agent:main:main"
+token_env = "GHI003_GATEWAY_TOKEN"
 timeout_seconds = 30.0
 
 [retry]
@@ -40,12 +49,44 @@ require_private_ingress = true
 allow_http_only_for_localhost = false
 mask_secrets_in_logs = true
 
+[mailbox_auth]
+header_name = "Authorization"
+scheme = "Bearer"
+
+[mailbox_auth.tokens]
+OptionABC001 = "RELAY_MAILBOX_TOKEN_OPTIONABC001"
+OptionDEF002 = "RELAY_MAILBOX_TOKEN_OPTIONDEF002"
+OptionGHI003 = "RELAY_MAILBOX_TOKEN_OPTIONGHI003"
+
 [audit]
 mode = "preview"
 jsonl_path = "../var/log/openclaw-relay/a2a-audit.jsonl"
 
 [behavior]
-schema_version = "relay-envelope/v1"
+schema_version = "relay-message/v1"
 default_ttl_seconds = 300
 duplicate_policy = "suppress"
 inject_notice_on_error = true
+
+[rabbitmq]
+host = "rabbitmq.local"
+port = 5672
+virtual_host = "/openclaw-relay"
+user_env = "RABBITMQ_USER"
+password_env = "RABBITMQ_PASSWORD"
+heartbeat_seconds = 30
+blocked_connection_timeout_seconds = 30
+prefetch_count = 4
+queue_type = "quorum"
+dispatch_exchange = "relay.dispatch.direct"
+reply_exchange = "relay.reply.direct"
+mailbox_exchange = "relay.mailbox.direct"
+deadletter_exchange = "relay.dead.direct"
+events_exchange = "relay.events.topic"
+mailbox_queue_prefix = "relay.mailbox"
+worker_queue_prefix = "relay.worker"
+control_queue_prefix = "relay.control"
+deadletter_queue_prefix = "relay.deadletter"
+
+[rabbitmq.tls]
+enabled = false

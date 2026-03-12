@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import secrets
 import tomllib
 from typing import Any
 
@@ -27,13 +28,6 @@ class TunnelConfig:
     remote_host: str
     remote_port: int
     token_config_path: Path
-
-
-@dataclass(frozen=True)
-class SourceSyncConfig:
-    ssh: SSHConnectionConfig
-    remote_path: str
-    sync_interval_ms: int
 
 
 @dataclass(frozen=True)
@@ -98,6 +92,20 @@ class SecurityConfig:
 
 
 @dataclass(frozen=True)
+class MailboxAuthConfig:
+    header_name: str
+    scheme: str
+    token_env_by_mailbox: tuple[tuple[str, str], ...]
+
+    def resolve_authenticated_mailbox(self, token: str) -> str | None:
+        for mailbox, env_name in self.token_env_by_mailbox:
+            expected = os.environ.get(env_name)
+            if expected and secrets.compare_digest(expected, token):
+                return mailbox
+        return None
+
+
+@dataclass(frozen=True)
 class AuditConfig:
     mode: str
     jsonl_path: Path
@@ -112,17 +120,67 @@ class BehaviorConfig:
 
 
 @dataclass(frozen=True)
+class RabbitMQTLSConfig:
+    enabled: bool
+    ca_path: Path | None
+    cert_path: Path | None
+    key_path: Path | None
+    server_hostname: str | None
+
+
+@dataclass(frozen=True)
+class RabbitMQConfig:
+    host: str
+    port: int
+    virtual_host: str
+    user_env: str
+    password_env: str
+    heartbeat_seconds: int
+    blocked_connection_timeout_seconds: int
+    prefetch_count: int
+    queue_type: str
+    dispatch_exchange: str
+    reply_exchange: str
+    mailbox_exchange: str
+    deadletter_exchange: str
+    events_exchange: str
+    mailbox_queue_prefix: str
+    worker_queue_prefix: str
+    control_queue_prefix: str
+    deadletter_queue_prefix: str
+    tls: RabbitMQTLSConfig | None = None
+
+    def resolve_username(self) -> str:
+        username = os.environ.get(self.user_env)
+        if not username:
+            raise ConfigError(
+                f"environment variable {self.user_env!r} is required for RabbitMQ username"
+            )
+        return username
+
+    def resolve_password(self) -> str:
+        password = os.environ.get(self.password_env)
+        if not password:
+            raise ConfigError(
+                f"environment variable {self.password_env!r} is required for RabbitMQ password"
+            )
+        return password
+
+
+@dataclass(frozen=True)
 class AppConfig:
     relay: RelayConfig
     endpoint_a: EndpointConfig
     endpoint_b: EndpointConfig
-    source_sync: SourceSyncConfig | None
     retry: RetryConfig
     security: SecurityConfig
     audit: AuditConfig
     behavior: BehaviorConfig
+    mailbox_auth: MailboxAuthConfig | None = None
+    rabbitmq: RabbitMQConfig | None = None
     workers: tuple[EndpointConfig, ...] = ()
     default_worker_name: str | None = None
+    transport_mode: str = "responses"
 
     @property
     def default_worker(self) -> EndpointConfig:
@@ -160,8 +218,10 @@ class AppConfig:
         routing_table = _optional_table(data, "routing")
         retry_table = _require_table(data, "retry")
         security_table = _require_table(data, "security")
+        mailbox_auth = _load_mailbox_auth(data)
         audit_table = _require_table(data, "audit")
         behavior_table = _require_table(data, "behavior")
+        rabbitmq = _load_rabbitmq(data, base_dir)
 
         relay = RelayConfig(
             node_id=_require_str(relay_table, "node_id"),
@@ -185,7 +245,6 @@ class AppConfig:
         endpoint_b = _select_default_worker(workers, default_worker_name) or _load_endpoint(
             "b", endpoints_table, base_dir
         )
-        source_sync = _load_source_sync(data, base_dir)
 
         return cls(
             relay=relay,
@@ -193,7 +252,7 @@ class AppConfig:
             endpoint_b=endpoint_b,
             workers=workers,
             default_worker_name=default_worker_name,
-            source_sync=source_sync,
+            transport_mode=_load_transport_mode(routing_table),
             retry=RetryConfig(
                 max_attempts_b=_require_positive_int(retry_table, "max_attempts_b"),
                 max_attempts_a=_require_positive_int(retry_table, "max_attempts_a"),
@@ -208,6 +267,7 @@ class AppConfig:
                 ),
                 mask_secrets_in_logs=_require_bool(security_table, "mask_secrets_in_logs"),
             ),
+            mailbox_auth=mailbox_auth,
             audit=AuditConfig(
                 mode=_require_str(audit_table, "mode"),
                 jsonl_path=_resolve_path(base_dir, _require_str(audit_table, "jsonl_path")),
@@ -220,6 +280,7 @@ class AppConfig:
                     behavior_table, "inject_notice_on_error"
                 ),
             ),
+            rabbitmq=rabbitmq,
         )
 
 
@@ -270,6 +331,15 @@ def _load_workers(
     return (), None
 
 
+def _load_transport_mode(routing_table: dict[str, Any] | None) -> str:
+    if routing_table is None or "transport" not in routing_table:
+        return "responses"
+    transport_mode = _require_str(routing_table, "transport").lower()
+    if transport_mode not in {"responses", "rabbitmq"}:
+        raise ConfigError("routing.transport must be 'responses' or 'rabbitmq'")
+    return transport_mode
+
+
 def _select_default_worker(
     workers: tuple[EndpointConfig, ...],
     default_worker_name: str | None,
@@ -283,24 +353,108 @@ def _select_default_worker(
     return workers[0]
 
 
-def _load_source_sync(data: dict[str, Any], base_dir: Path) -> SourceSyncConfig | None:
-    table = data.get("source_sync")
+def _load_rabbitmq(data: dict[str, Any], base_dir: Path) -> RabbitMQConfig | None:
+    table = _optional_table(data, "rabbitmq")
     if table is None:
         return None
-    if not isinstance(table, dict):
-        raise ConfigError("configuration key 'source_sync' must be a table")
-    enabled = table.get("enabled", True)
-    if not isinstance(enabled, bool):
-        raise ConfigError("configuration key 'source_sync.enabled' must be a boolean")
-    if not enabled:
+    tls = _load_rabbitmq_tls(table, base_dir)
+    queue_type = _require_str(table, "queue_type") if "queue_type" in table else "quorum"
+    if queue_type not in {"quorum", "classic"}:
+        raise ConfigError("configuration key 'rabbitmq.queue_type' must be 'quorum' or 'classic'")
+    return RabbitMQConfig(
+        host=_require_str(table, "host"),
+        port=_require_port(table, "port") if "port" in table else 5672,
+        virtual_host=_require_str(table, "virtual_host") if "virtual_host" in table else "/",
+        user_env=_require_str(table, "user_env"),
+        password_env=_require_str(table, "password_env"),
+        heartbeat_seconds=_require_positive_int(table, "heartbeat_seconds")
+        if "heartbeat_seconds" in table
+        else 30,
+        blocked_connection_timeout_seconds=_require_positive_int(
+            table, "blocked_connection_timeout_seconds"
+        )
+        if "blocked_connection_timeout_seconds" in table
+        else 30,
+        prefetch_count=_require_positive_int(table, "prefetch_count")
+        if "prefetch_count" in table
+        else 4,
+        queue_type=queue_type,
+        dispatch_exchange=_require_str(table, "dispatch_exchange")
+        if "dispatch_exchange" in table
+        else "relay.dispatch.direct",
+        reply_exchange=_require_str(table, "reply_exchange")
+        if "reply_exchange" in table
+        else "relay.reply.direct",
+        mailbox_exchange=_require_str(table, "mailbox_exchange")
+        if "mailbox_exchange" in table
+        else "relay.mailbox.direct",
+        deadletter_exchange=_require_str(table, "deadletter_exchange")
+        if "deadletter_exchange" in table
+        else "relay.dead.direct",
+        events_exchange=_require_str(table, "events_exchange")
+        if "events_exchange" in table
+        else "relay.events.topic",
+        mailbox_queue_prefix=_require_str(table, "mailbox_queue_prefix")
+        if "mailbox_queue_prefix" in table
+        else "relay.mailbox",
+        worker_queue_prefix=_require_str(table, "worker_queue_prefix")
+        if "worker_queue_prefix" in table
+        else "relay.worker",
+        control_queue_prefix=_require_str(table, "control_queue_prefix")
+        if "control_queue_prefix" in table
+        else "relay.control",
+        deadletter_queue_prefix=_require_str(table, "deadletter_queue_prefix")
+        if "deadletter_queue_prefix" in table
+        else "relay.deadletter",
+        tls=tls,
+    )
+
+
+def _load_mailbox_auth(data: dict[str, Any]) -> MailboxAuthConfig | None:
+    table = _optional_table(data, "mailbox_auth")
+    if table is None:
         return None
-    ssh = _load_ssh_connection(table, base_dir)
-    return SourceSyncConfig(
-        ssh=ssh,
-        remote_path=_require_str(table, "remote_path"),
-        sync_interval_ms=_require_positive_int(table, "sync_interval_ms")
-        if "sync_interval_ms" in table
-        else 5000,
+    tokens_table = _require_table(table, "tokens")
+    pairs: list[tuple[str, str]] = []
+    for mailbox in sorted(tokens_table):
+        env_name = _require_str(tokens_table, mailbox)
+        pairs.append((mailbox.strip(), env_name))
+    if not pairs:
+        raise ConfigError("mailbox_auth.tokens must define at least one mailbox token")
+    return MailboxAuthConfig(
+        header_name=_require_str(table, "header_name") if "header_name" in table else "Authorization",
+        scheme=_require_str(table, "scheme") if "scheme" in table else "Bearer",
+        token_env_by_mailbox=tuple(pairs),
+    )
+
+
+def _load_rabbitmq_tls(table: dict[str, Any], base_dir: Path) -> RabbitMQTLSConfig | None:
+    tls_table = _optional_table(table, "tls")
+    if tls_table is None:
+        return None
+    enabled = _require_bool(tls_table, "enabled") if "enabled" in tls_table else True
+    if not enabled:
+        return RabbitMQTLSConfig(
+            enabled=False,
+            ca_path=None,
+            cert_path=None,
+            key_path=None,
+            server_hostname=None,
+        )
+    return RabbitMQTLSConfig(
+        enabled=True,
+        ca_path=_resolve_path(base_dir, _require_str(tls_table, "ca_path"))
+        if "ca_path" in tls_table
+        else None,
+        cert_path=_resolve_path(base_dir, _require_str(tls_table, "cert_path"))
+        if "cert_path" in tls_table
+        else None,
+        key_path=_resolve_path(base_dir, _require_str(tls_table, "key_path"))
+        if "key_path" in tls_table
+        else None,
+        server_hostname=_require_str(tls_table, "server_hostname")
+        if "server_hostname" in tls_table
+        else None,
     )
 
 

@@ -69,6 +69,23 @@ SCHEMA_STATEMENTS = (
         FOREIGN KEY(message_id) REFERENCES messages(id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS mailbox_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id TEXT UNIQUE NOT NULL,
+        conversation_id TEXT NOT NULL,
+        from_mailbox TEXT NOT NULL,
+        to_mailbox TEXT NOT NULL,
+        body TEXT NOT NULL,
+        notify_human INTEGER NOT NULL DEFAULT 0,
+        in_reply_to TEXT,
+        status TEXT NOT NULL,
+        queued_at TEXT NOT NULL,
+        dequeued_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
 )
 
 
@@ -136,6 +153,11 @@ class StateStore:
                 ("message_id", "INTEGER"),
                 ("error_text", "TEXT"),
             ),
+        )
+        self._ensure_columns(
+            connection,
+            table_name="mailbox_messages",
+            columns=(("notify_human", "INTEGER NOT NULL DEFAULT 0"),),
         )
 
     def _ensure_columns(
@@ -415,6 +437,33 @@ class StateStore:
                 (message_id,),
             ).fetchone()
 
+    def get_message_by_turn_id(self, turn_id: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT
+                    id,
+                    idempotency_key,
+                    task_id,
+                    turn_id,
+                    filename,
+                    watch_path,
+                    processing_path,
+                    reply_path,
+                    reply_text,
+                    status,
+                    last_error,
+                    next_attempt_at,
+                    worker_name,
+                    worker_display_name,
+                    created_at,
+                    updated_at
+                FROM messages
+                WHERE turn_id = ?
+                """,
+                (turn_id,),
+            ).fetchone()
+
     def list_messages_by_status(self, statuses: tuple[str, ...]) -> list[sqlite3.Row]:
         placeholders = ",".join("?" for _ in statuses)
         with self.connect() as connection:
@@ -482,6 +531,255 @@ class StateStore:
                 """,
                 (idempotency_key,),
             ).fetchone()
+
+    def enqueue_mailbox_message(
+        self,
+        *,
+        message_id: str,
+        conversation_id: str,
+        from_mailbox: str,
+        to_mailbox: str,
+        body: str,
+        notify_human: bool = False,
+        queued_at: str,
+        in_reply_to: str | None = None,
+        status: str = "queued",
+    ) -> sqlite3.Row:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO mailbox_messages (
+                    message_id,
+                    conversation_id,
+                    from_mailbox,
+                    to_mailbox,
+                    body,
+                    notify_human,
+                    in_reply_to,
+                    status,
+                    queued_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    conversation_id,
+                    from_mailbox,
+                    to_mailbox,
+                    body,
+                    1 if notify_human else 0,
+                    in_reply_to,
+                    status,
+                    queued_at,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    message_id,
+                    conversation_id,
+                    from_mailbox,
+                    to_mailbox,
+                    body,
+                    notify_human,
+                    in_reply_to,
+                    status,
+                    queued_at,
+                    dequeued_at,
+                    created_at,
+                    updated_at
+                FROM mailbox_messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return row
+
+    def update_mailbox_message_status(
+        self,
+        *,
+        message_id: str,
+        status: str,
+        dequeued_at: str | None = None,
+    ) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE mailbox_messages
+                SET
+                    status = ?,
+                    dequeued_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE message_id = ?
+                """,
+                (status, dequeued_at, message_id),
+            )
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    message_id,
+                    conversation_id,
+                    from_mailbox,
+                    to_mailbox,
+                    body,
+                    notify_human,
+                    in_reply_to,
+                    status,
+                    queued_at,
+                    dequeued_at,
+                    created_at,
+                    updated_at
+                FROM mailbox_messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+            connection.commit()
+        return row
+
+    def get_mailbox_message(self, message_id: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT
+                    id,
+                    message_id,
+                    conversation_id,
+                    from_mailbox,
+                    to_mailbox,
+                    body,
+                    notify_human,
+                    in_reply_to,
+                    status,
+                    queued_at,
+                    dequeued_at,
+                    created_at,
+                    updated_at
+                FROM mailbox_messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+
+    def dequeue_mailbox_message(self, *, mailbox: str) -> sqlite3.Row | None:
+        dequeued_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        message_id,
+                        conversation_id,
+                        from_mailbox,
+                        to_mailbox,
+                        body,
+                        notify_human,
+                        in_reply_to,
+                        status,
+                        queued_at,
+                        dequeued_at,
+                        created_at,
+                        updated_at
+                    FROM mailbox_messages
+                    WHERE to_mailbox = ? AND status = 'queued'
+                    ORDER BY id
+                    LIMIT 1
+                    """,
+                    (mailbox,),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+                connection.execute(
+                    """
+                    UPDATE mailbox_messages
+                    SET
+                        status = ?,
+                        dequeued_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    ("delivered", dequeued_at, row["id"]),
+                )
+                updated_row = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        message_id,
+                        conversation_id,
+                        from_mailbox,
+                        to_mailbox,
+                        body,
+                        notify_human,
+                        in_reply_to,
+                        status,
+                        queued_at,
+                        dequeued_at,
+                        created_at,
+                        updated_at
+                    FROM mailbox_messages
+                    WHERE id = ?
+                    """,
+                    (row["id"],),
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return updated_row
+
+    def list_mailbox_messages(self) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT
+                    id,
+                    message_id,
+                    conversation_id,
+                    from_mailbox,
+                    to_mailbox,
+                    body,
+                    notify_human,
+                    in_reply_to,
+                    status,
+                    queued_at,
+                    dequeued_at,
+                    created_at,
+                    updated_at
+                FROM mailbox_messages
+                ORDER BY id
+                """
+            ).fetchall()
+
+    def count_mailbox_messages_by_status(self) -> dict[str, int]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM mailbox_messages
+                GROUP BY status
+                ORDER BY status
+                """
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def count_mailbox_queue_depths(self) -> dict[str, int]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT to_mailbox, COUNT(*) AS count
+                FROM mailbox_messages
+                WHERE status = 'queued'
+                GROUP BY to_mailbox
+                ORDER BY to_mailbox
+                """
+            ).fetchall()
+        return {str(row["to_mailbox"]): int(row["count"]) for row in rows}
 
     def list_seen_files(self) -> list[sqlite3.Row]:
         with self.connect() as connection:
@@ -562,6 +860,18 @@ class StateStore:
                 WHERE message_id = ? AND target = ?
                 """,
                 (message_id, target),
+            ).fetchone()
+        return int(row["count"])
+
+    def count_attempts_by_result(self, *, message_id: int, target: str, result: str) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM attempts
+                WHERE message_id = ? AND target = ? AND result = ?
+                """,
+                (message_id, target, result),
             ).fetchone()
         return int(row["count"])
 

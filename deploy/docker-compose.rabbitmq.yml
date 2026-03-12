@@ -1,0 +1,12 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: openclaw-relay-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: relay
+      RABBITMQ_DEFAULT_PASS: relay-dev-pass
+      RABBITMQ_DEFAULT_VHOST: /openclaw-relay
+    ports:
+      - "5672:5672"
+      - "15672:15672"

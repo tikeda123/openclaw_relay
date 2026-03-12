@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
 from typing import Callable
+from urllib.parse import parse_qs, urlsplit
 
 
 class HealthServer:
@@ -20,6 +21,9 @@ class HealthServer:
         dashboard_html: str | None = None,
         ops_html: str | None = None,
         alert_webhook: Callable[[dict[str, object]], dict[str, object] | None] | None = None,
+        mailbox_send: Callable[[dict[str, object]], dict[str, object]] | None = None,
+        mailbox_receive: Callable[[str], dict[str, object] | None] | None = None,
+        mailbox_authenticate: Callable[[str, dict[str, str]], str | None] | None = None,
     ) -> None:
         handler = self._build_handler(
             alive_probe=alive_probe,
@@ -29,6 +33,9 @@ class HealthServer:
             dashboard_html=dashboard_html,
             ops_html=ops_html,
             alert_webhook=alert_webhook,
+            mailbox_send=mailbox_send,
+            mailbox_receive=mailbox_receive,
+            mailbox_authenticate=mailbox_authenticate,
         )
         self._server = ThreadingHTTPServer((host, port), handler)
         self._thread = threading.Thread(
@@ -59,52 +66,103 @@ class HealthServer:
         dashboard_html: str | None,
         ops_html: str | None,
         alert_webhook: Callable[[dict[str, object]], dict[str, object] | None] | None,
+        mailbox_send: Callable[[dict[str, object]], dict[str, object]] | None,
+        mailbox_receive: Callable[[str], dict[str, object] | None] | None,
+        mailbox_authenticate: Callable[[str, dict[str, str]], str | None] | None,
     ) -> type[BaseHTTPRequestHandler]:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
-                if self.path in {"/", "/ui"}:
+                parsed = urlsplit(self.path)
+                route = parsed.path
+                query = parse_qs(parsed.query, keep_blank_values=False)
+
+                if route in {"/", "/ui"}:
                     if dashboard_html is None:
                         self.send_error(HTTPStatus.NOT_FOUND)
                         return
                     self._write_html(dashboard_html)
                     return
-                if self.path in {"/ops", "/monitor"}:
+                if route in {"/ops", "/monitor"}:
                     if ops_html is None:
                         self.send_error(HTTPStatus.NOT_FOUND)
                         return
                     self._write_html(ops_html)
                     return
-                if self.path == "/api/dashboard":
+                if route == "/api/dashboard":
                     if dashboard_probe is None:
                         self.send_error(HTTPStatus.NOT_FOUND)
                         return
                     try:
                         payload = dashboard_probe()
                     except Exception as exc:  # pragma: no cover - defensive
-                        self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
-                        self.send_header("Content-Type", "application/json")
-                        error_body = json.dumps({"error": str(exc)}).encode("utf-8")
-                        self.send_header("Content-Length", str(len(error_body)))
-                        self.end_headers()
-                        self.wfile.write(error_body)
+                        self._write_json(
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                            {"error": str(exc)},
+                        )
                         return
-                    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Cache-Control", "no-store")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._write_json(HTTPStatus.OK, payload, cache_control="no-store")
                     return
-                if self.path == "/healthz":
+                if route == "/v1/messages":
+                    if mailbox_receive is None:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    try:
+                        authenticated_mailbox = self._authenticate_mailbox("GET")
+                    except PermissionError as exc:
+                        self._write_json(
+                            HTTPStatus.UNAUTHORIZED,
+                            {"error": str(exc)},
+                            headers={"WWW-Authenticate": "Bearer"},
+                        )
+                        return
+                    requested_mailbox = self._mailbox_name(query)
+                    if authenticated_mailbox is not None:
+                        if (
+                            requested_mailbox is not None
+                            and requested_mailbox != authenticated_mailbox
+                        ):
+                            self._write_json(
+                                HTTPStatus.FORBIDDEN,
+                                {
+                                    "error": "requested mailbox does not match authenticated mailbox"
+                                },
+                            )
+                            return
+                        mailbox = authenticated_mailbox
+                    else:
+                        mailbox = requested_mailbox
+                        if mailbox is None:
+                            self.send_error(
+                                HTTPStatus.BAD_REQUEST,
+                                "query parameter 'for' or X-Relay-Mailbox header is required",
+                            )
+                            return
+                    try:
+                        payload = mailbox_receive(mailbox)
+                    except ValueError as exc:
+                        self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                        return
+                    except Exception as exc:  # pragma: no cover - defensive
+                        self._write_json(
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                            {"error": str(exc)},
+                        )
+                        return
+                    if payload is None:
+                        self.send_response(HTTPStatus.NO_CONTENT)
+                        self.end_headers()
+                        return
+                    self._write_json(HTTPStatus.OK, payload, cache_control="no-store")
+                    return
+                if route == "/healthz":
                     self._write_status(HTTPStatus.OK if alive_probe() else HTTPStatus.SERVICE_UNAVAILABLE)
                     return
-                if self.path == "/readyz":
+                if route == "/readyz":
                     self._write_status(
                         HTTPStatus.OK if ready_probe() else HTTPStatus.SERVICE_UNAVAILABLE
                     )
                     return
-                if self.path == "/metrics":
+                if route == "/metrics":
                     if metrics_probe is None:
                         self.send_error(HTTPStatus.NOT_FOUND)
                         return
@@ -127,12 +185,73 @@ class HealthServer:
                 self.send_error(HTTPStatus.NOT_FOUND)
 
             def do_POST(self) -> None:  # noqa: N802
-                if self.path != "/api/alertmanager/webhook":
+                route = urlsplit(self.path).path
+                if route != "/api/alertmanager/webhook":
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
                 if alert_webhook is None:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
+                try:
+                    payload = self._read_json_object()
+                except ValueError as exc:
+                    self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                    return
+                try:
+                    response_payload = alert_webhook(payload) or {"status": "accepted"}
+                except ValueError as exc:
+                    self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                    return
+                except Exception as exc:  # pragma: no cover - defensive
+                    self._write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"error": str(exc)},
+                    )
+                    return
+                self._write_json(HTTPStatus.ACCEPTED, response_payload)
+
+            def do_PUT(self) -> None:  # noqa: N802
+                route = urlsplit(self.path).path
+                if route != "/v1/messages":
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                if mailbox_send is None:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                try:
+                    payload = self._read_json_object()
+                except ValueError as exc:
+                    self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                    return
+                try:
+                    authenticated_mailbox = self._authenticate_mailbox("PUT")
+                except PermissionError as exc:
+                    self._write_json(
+                        HTTPStatus.UNAUTHORIZED,
+                        {"error": str(exc)},
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                    return
+                if authenticated_mailbox is not None:
+                    payload["from"] = authenticated_mailbox
+                    payload["fromGateway"] = authenticated_mailbox
+                try:
+                    response_payload = mailbox_send(payload)
+                except ValueError as exc:
+                    self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                    return
+                except Exception as exc:  # pragma: no cover - defensive
+                    self._write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"error": str(exc)},
+                    )
+                    return
+                self._write_json(HTTPStatus.ACCEPTED, response_payload)
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+            def _read_json_object(self) -> dict[str, object]:
                 content_length = self.headers.get("Content-Length", "0")
                 try:
                     body_length = int(content_length)
@@ -141,39 +260,51 @@ class HealthServer:
                 body = self.rfile.read(max(0, body_length))
                 try:
                     payload = json.loads(body.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    self.send_error(HTTPStatus.BAD_REQUEST, "invalid JSON payload")
-                    return
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("invalid JSON payload") from exc
                 if not isinstance(payload, dict):
-                    self.send_error(HTTPStatus.BAD_REQUEST, "JSON payload must be an object")
-                    return
-                try:
-                    response_payload = alert_webhook(payload) or {"status": "accepted"}
-                except ValueError as exc:
-                    self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
-                    return
-                except Exception as exc:  # pragma: no cover - defensive
-                    error_body = json.dumps({"error": str(exc)}).encode("utf-8")
-                    self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Length", str(len(error_body)))
-                    self.end_headers()
-                    self.wfile.write(error_body)
-                    return
-                response_body = json.dumps(response_payload, ensure_ascii=False).encode("utf-8")
-                self.send_response(HTTPStatus.ACCEPTED)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(response_body)))
-                self.end_headers()
-                self.wfile.write(response_body)
+                    raise ValueError("JSON payload must be an object")
+                return payload
 
-            def log_message(self, fmt: str, *args: object) -> None:
-                return
+            def _mailbox_name(self, query: dict[str, list[str]]) -> str | None:
+                header_value = self.headers.get("X-Relay-Mailbox")
+                if isinstance(header_value, str) and header_value.strip():
+                    return header_value.strip()
+                values = query.get("for") or []
+                if not values:
+                    return None
+                mailbox = values[0].strip()
+                return mailbox or None
+
+            def _authenticate_mailbox(self, method: str) -> str | None:
+                if mailbox_authenticate is None:
+                    return None
+                return mailbox_authenticate(method, dict(self.headers.items()))
 
             def _write_status(self, status: HTTPStatus) -> None:
                 body = json.dumps({"status": status.phrase.lower().replace(" ", "_")}).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _write_json(
+                self,
+                status: HTTPStatus,
+                payload: dict[str, object],
+                *,
+                cache_control: str | None = None,
+                headers: dict[str, str] | None = None,
+            ) -> None:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                if cache_control is not None:
+                    self.send_header("Cache-Control", cache_control)
+                if headers is not None:
+                    for key, value in headers.items():
+                        self.send_header(key, value)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)

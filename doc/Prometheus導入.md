@@ -127,7 +127,8 @@ curl -fsS 'http://127.0.0.1:9090/api/v1/targets' | python3 -m json.tool | head -
 
 ```promql
 openclaw_relay_ready
-openclaw_relay_source_sync_healthy
+openclaw_relay_mailbox_queue_depth
+openclaw_relay_mailbox_message_status_total
 openclaw_relay_worker_deadletter_total
 openclaw_relay_worker_attempt_total{result="FAILED"}
 openclaw_relay_worker_latency_seconds{stage="dispatch",stat="latest"}

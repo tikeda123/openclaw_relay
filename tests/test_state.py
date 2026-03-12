@@ -20,6 +20,7 @@ class StateStoreTests(unittest.TestCase):
             self.assertIn("seen_files", tables)
             self.assertIn("attempts", tables)
             self.assertIn("audit_index", tables)
+            self.assertIn("mailbox_messages", tables)
 
     def test_attempt_and_audit_records_can_be_created(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,6 +100,47 @@ class StateStoreTests(unittest.TestCase):
             assert row is not None
             self.assertEqual(row["status"], "FAILED_B")
             self.assertEqual(row["next_attempt_at"], "2026-03-09T00:00:00Z")
+
+    def test_mailbox_messages_are_dequeued_fifo_and_removed_from_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "relay.db"
+            store = StateStore(database_path)
+            store.initialize()
+
+            store.enqueue_mailbox_message(
+                message_id="msg-1",
+                conversation_id="conv-1",
+                from_mailbox="OptionABC001",
+                to_mailbox="OptionDEF002",
+                body="first",
+                queued_at="2026-03-11T13:00:00+00:00",
+            )
+            store.enqueue_mailbox_message(
+                message_id="msg-2",
+                conversation_id="conv-2",
+                from_mailbox="OptionABC001",
+                to_mailbox="OptionDEF002",
+                body="second",
+                queued_at="2026-03-11T13:00:01+00:00",
+            )
+
+            first = store.dequeue_mailbox_message(mailbox="OptionDEF002")
+            second = store.dequeue_mailbox_message(mailbox="OptionDEF002")
+            third = store.dequeue_mailbox_message(mailbox="OptionDEF002")
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            assert first is not None
+            assert second is not None
+            self.assertEqual(first["message_id"], "msg-1")
+            self.assertEqual(second["message_id"], "msg-2")
+            self.assertEqual(first["status"], "delivered")
+            self.assertEqual(second["status"], "delivered")
+            self.assertIsNotNone(first["dequeued_at"])
+            self.assertIsNotNone(second["dequeued_at"])
+            self.assertIsNone(third)
+            self.assertEqual(store.count_mailbox_queue_depths(), {})
+            self.assertEqual(store.count_mailbox_messages_by_status()["delivered"], 2)
 
 
 if __name__ == "__main__":
